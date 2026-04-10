@@ -129,7 +129,12 @@ public class FilesTableTest extends TableTestBase {
     }
 
     private List<String> readPartBucketLevel(Predicate predicate) throws IOException {
-        ReadBuilder readBuilder = filesTable.newReadBuilder().withFilter(predicate);
+        return readPartBucketLevel(filesTable, predicate);
+    }
+
+    private List<String> readPartBucketLevel(FilesTable table, Predicate predicate)
+            throws IOException {
+        ReadBuilder readBuilder = table.newReadBuilder().withFilter(predicate);
         List<String> rows = new ArrayList<>();
         readBuilder
                 .newRead()
@@ -208,6 +213,43 @@ public class FilesTableTest extends TableTestBase {
     public void testReadWithNotFullPartitionKey() throws Exception {
         PredicateBuilder builder = new PredicateBuilder(FilesTable.TABLE_TYPE);
         assertThat(readPartBucketLevel(builder.equal(0, "[2]"))).isEmpty();
+    }
+
+    @Test
+    public void testReadWithPartitionValueContainingSeparator() throws Exception {
+        String tableName = "CommaPartitionFilesTable";
+        Identifier tableIdentifier = identifier(tableName);
+        Schema schema =
+                Schema.newBuilder()
+                        .column("pk", DataTypes.INT())
+                        .column("pt", DataTypes.STRING())
+                        .column("col1", DataTypes.INT())
+                        .partitionKeys("pt")
+                        .primaryKey("pk", "pt")
+                        .option(CoreOptions.BUCKET.key(), "1")
+                        .build();
+        catalog.createTable(tableIdentifier, schema, true);
+
+        FileStoreTable commaTable = getTable(tableIdentifier);
+        write(commaTable, GenericRow.of(1, BinaryString.fromString("hello, world"), 1));
+        write(commaTable, GenericRow.of(2, BinaryString.fromString("other"), 2));
+
+        FilesTable commaFilesTable =
+                (FilesTable)
+                        catalog.getTable(
+                                identifier(
+                                        tableName + SYSTEM_TABLE_SPLITTER + FilesTable.FILES));
+        PredicateBuilder builder = new PredicateBuilder(FilesTable.TABLE_TYPE);
+
+        assertThat(readPartBucketLevel(commaFilesTable, null))
+                .containsExactlyInAnyOrder("{hello, world}-0-0", "{other}-0-0");
+
+        // the partition value itself contains the ", " separator of the rendered form
+        assertThat(
+                        readPartBucketLevel(
+                                commaFilesTable,
+                                builder.equal(0, BinaryString.fromString("{hello, world}"))))
+                .containsExactlyInAnyOrder("{hello, world}-0-0");
     }
 
     @Test

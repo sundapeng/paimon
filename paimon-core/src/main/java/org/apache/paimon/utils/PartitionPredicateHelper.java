@@ -113,7 +113,7 @@ public class PartitionPredicateHelper {
         if (partitionStr.endsWith("}")) {
             partitionStr = partitionStr.substring(0, partitionStr.length() - 1);
         }
-        String[] partFields = partitionStr.split(", ");
+        String[] partFields = partitionStr.split(", ", partitionKeys.size());
         if (partitionKeys.size() != partFields.length) {
             return null;
         }
