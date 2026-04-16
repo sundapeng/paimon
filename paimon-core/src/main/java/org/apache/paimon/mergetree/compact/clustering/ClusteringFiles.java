@@ -69,6 +69,10 @@ public class ClusteringFiles {
             unsortedFiles.remove(file);
         } else {
             sortedFiles.remove(file);
+            Integer fileId = fileNameToIdMap.remove(file.fileName());
+            if (fileId != null) {
+                idToFileMap.remove(fileId);
+            }
         }
     }
 
@@ -77,7 +81,11 @@ public class ClusteringFiles {
     }
 
     public synchronized int getFileIdByName(String fileName) {
-        return fileNameToIdMap.get(fileName);
+        Integer fileId = fileNameToIdMap.get(fileName);
+        if (fileId == null) {
+            throw new IllegalStateException("File not found in ClusteringFiles: " + fileName);
+        }
+        return fileId;
     }
 
     public synchronized List<DataFileMeta> allFiles() {
