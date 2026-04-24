@@ -1667,6 +1667,32 @@ class SchemaValidationTest {
     }
 
     @Test
+    public void testCompactionSmallFileRatioValid() {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.COMPACTION_SMALL_FILE_RATIO.key(), "0.7");
+        assertThatNoException().isThrownBy(() -> validateTableSchemaExec(options));
+
+        options.put(CoreOptions.COMPACTION_SMALL_FILE_RATIO.key(), "1.0");
+        assertThatNoException().isThrownBy(() -> validateTableSchemaExec(options));
+    }
+
+    @Test
+    public void testCompactionSmallFileRatioInvalid() {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.COMPACTION_SMALL_FILE_RATIO.key(), "0");
+        assertThatThrownBy(() -> validateTableSchemaExec(options))
+                .hasMessageContaining("compaction.small-file-ratio should be in range (0, 1]");
+
+        options.put(CoreOptions.COMPACTION_SMALL_FILE_RATIO.key(), "-0.5");
+        assertThatThrownBy(() -> validateTableSchemaExec(options))
+                .hasMessageContaining("compaction.small-file-ratio should be in range (0, 1]");
+
+        options.put(CoreOptions.COMPACTION_SMALL_FILE_RATIO.key(), "1.5");
+        assertThatThrownBy(() -> validateTableSchemaExec(options))
+                .hasMessageContaining("compaction.small-file-ratio should be in range (0, 1]");
+    }
+
+    @Test
     void testRowTrackingWithPkTable() {
         Map<String, String> options = new HashMap<>();
         options.put(CoreOptions.ROW_TRACKING_ENABLED.key(), "true");

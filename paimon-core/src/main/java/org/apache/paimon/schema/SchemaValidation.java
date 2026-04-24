@@ -258,6 +258,14 @@ public class SchemaValidation {
                         + " should not be larger than "
                         + CHANGELOG_NUM_RETAINED_MAX.key());
 
+        double smallFileRatio =
+                options.toConfiguration().get(CoreOptions.COMPACTION_SMALL_FILE_RATIO);
+        checkArgument(
+                smallFileRatio > 0 && smallFileRatio <= 1,
+                "%s should be in range (0, 1], but was %s",
+                CoreOptions.COMPACTION_SMALL_FILE_RATIO.key(),
+                smallFileRatio);
+
         FileFormat fileFormat =
                 FileFormat.fromIdentifier(options.formatType(), new Options(schema.options()));
         RowType tableRowType = new RowType(schema.fields());

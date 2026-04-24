@@ -953,7 +953,7 @@ public class CoreOptions implements Serializable {
                                     + "target-file-size * compaction.small-file-ratio will be "
                                     + "picked for compaction rewriting. This avoids compacting the same "
                                     + "file repeatedly due to compression inaccuracy causing output files "
-                                    + "to be slightly smaller than the target size.");
+                                    + "to be slightly smaller than the target size. Valid range: (0, 1].");
 
     public static final ConfigOption<MemorySize> BLOB_TARGET_FILE_SIZE =
             key("blob.target-file-size")
