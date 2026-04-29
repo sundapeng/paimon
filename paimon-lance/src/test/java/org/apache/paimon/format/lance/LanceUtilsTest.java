@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LanceUtilsTest {
@@ -103,5 +104,38 @@ class LanceUtilsTest {
         assertEquals("test-token", storageOptions.get(LanceUtils.STORAGE_OPTION_SESSION_TOKEN));
         assertEquals("test-token", storageOptions.get(LanceUtils.STORAGE_OPTION_OSS_SESSION_TOKEN));
         assertTrue(storageOptions.containsKey(LanceUtils.FS_OSS_SECURITY_TOKEN));
+    }
+
+    @Test
+    void testMissingOssConfigFailsWithClearError() {
+        Path path = new Path("oss://test-bucket/db-name.db/table-name/bucket-0/data.lance");
+        TestFileIO fileIO = new TestFileIO();
+        fileIO.setOptions(new Options());
+
+        IllegalArgumentException error =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> LanceUtils.toLanceSpecifiedForReader(fileIO, path));
+        assertTrue(
+                error.getMessage().contains(LanceUtils.FS_OSS_ENDPOINT),
+                "Error should name the missing option but was: " + error.getMessage());
+    }
+
+    @Test
+    void testPartialOssConfigFailsWithClearError() {
+        Path path = new Path("oss://test-bucket/db-name.db/table-name/bucket-0/data.lance");
+        Options options = new Options();
+        options.set(LanceUtils.FS_OSS_ENDPOINT, "oss-example-region.example.com");
+        options.set(LanceUtils.FS_OSS_ACCESS_KEY_ID, "test-key");
+        TestFileIO fileIO = new TestFileIO();
+        fileIO.setOptions(options);
+
+        IllegalArgumentException error =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> LanceUtils.toLanceSpecifiedForReader(fileIO, path));
+        assertTrue(
+                error.getMessage().contains(LanceUtils.FS_OSS_ACCESS_KEY_SECRET),
+                "Error should name the missing option but was: " + error.getMessage());
     }
 }

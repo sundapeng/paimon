@@ -24,6 +24,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.rest.RESTTokenFileIO;
 import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.Preconditions;
 
 import java.io.IOException;
 import java.net.URI;
@@ -92,9 +93,18 @@ public class LanceUtils {
                 converted = new Path(uriString.replace("traceable:/", "file:/"));
             }
         } else if ("oss".equals(schema)) {
-            assert originOptions.containsKey(FS_OSS_ENDPOINT);
-            assert originOptions.containsKey(FS_OSS_ACCESS_KEY_ID);
-            assert originOptions.containsKey(FS_OSS_ACCESS_KEY_SECRET);
+            Preconditions.checkArgument(
+                    originOptions.containsKey(FS_OSS_ENDPOINT),
+                    "OSS endpoint configuration '%s' is required for OSS scheme",
+                    FS_OSS_ENDPOINT);
+            Preconditions.checkArgument(
+                    originOptions.containsKey(FS_OSS_ACCESS_KEY_ID),
+                    "OSS access key id configuration '%s' is required for OSS scheme",
+                    FS_OSS_ACCESS_KEY_ID);
+            Preconditions.checkArgument(
+                    originOptions.containsKey(FS_OSS_ACCESS_KEY_SECRET),
+                    "OSS access key secret configuration '%s' is required for OSS scheme",
+                    FS_OSS_ACCESS_KEY_SECRET);
 
             for (String key : originOptions.keySet()) {
                 if (key.startsWith(FS_PREFIX)) {

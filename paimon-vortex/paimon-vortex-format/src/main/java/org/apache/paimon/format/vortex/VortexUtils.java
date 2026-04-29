@@ -24,6 +24,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.rest.RESTTokenFileIO;
 import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.Preconditions;
 
 import javax.annotation.Nullable;
 
@@ -77,6 +78,15 @@ public class VortexUtils {
         Options originOptions =
                 ((HadoopOptionsProvider) fileIO).hadoopOptions(path, isRead ? "read" : "write");
         Map<String, String> storageOptions = new HashMap<>();
+        Preconditions.checkArgument(
+                originOptions.containsKey("fs.oss.endpoint"),
+                "OSS endpoint configuration 'fs.oss.endpoint' is required for OSS scheme");
+        Preconditions.checkArgument(
+                originOptions.containsKey("fs.oss.accessKeyId"),
+                "OSS access key id configuration 'fs.oss.accessKeyId' is required for OSS scheme");
+        Preconditions.checkArgument(
+                originOptions.containsKey("fs.oss.accessKeySecret"),
+                "OSS access key secret configuration 'fs.oss.accessKeySecret' is required for OSS scheme");
         storageOptions.put(
                 "endpoint",
                 "https://" + uri.getHost() + "." + originOptions.get("fs.oss.endpoint"));
