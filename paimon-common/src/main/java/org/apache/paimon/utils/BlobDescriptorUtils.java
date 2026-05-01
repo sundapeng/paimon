@@ -82,8 +82,16 @@ public class BlobDescriptorUtils {
 
         if (descriptorSpecified.isEmpty()) {
             return currentContext == null ? CatalogContext.create(tableOptions) : currentContext;
-        } else {
+        } else if (currentContext == null) {
             return CatalogContext.create(Options.fromMap(descriptorSpecified));
+        } else {
+            Options merged = new Options(currentContext.options().toMap());
+            descriptorSpecified.forEach(merged::set);
+            return CatalogContext.create(
+                    merged,
+                    currentContext.hadoopConf(),
+                    currentContext.preferIO(),
+                    currentContext.fallbackIO());
         }
     }
 }
