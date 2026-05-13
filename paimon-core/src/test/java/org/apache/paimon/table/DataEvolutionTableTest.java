@@ -43,6 +43,8 @@ import org.apache.paimon.reader.DataEvolutionFileReader;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.stats.SimpleStatsEvolutions;
 import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
@@ -328,6 +330,69 @@ public class DataEvolutionTableTest extends DataEvolutionTestBase {
                     assertThat(r.getString(1).toString()).isEqualTo("a");
                     assertThat(r.getString(2)).isEqualTo(BinaryString.fromString("b"));
                 });
+    }
+
+    @Test
+    public void testSplitStatsWithPartialWrites() throws Exception {
+        createTableDefault();
+
+        Schema schema = schemaDefault();
+        RowType writeType0 = schema.rowType().project(Arrays.asList("f0", "f1"));
+        RowType writeType1 = schema.rowType().project(Collections.singletonList("f2"));
+
+        BatchWriteBuilder builder = getTableDefault().newBatchWriteBuilder();
+
+        // Commit 1: writes f0 and f1 only
+        try (BatchTableWrite write0 = builder.newWrite().withWriteType(writeType0)) {
+            for (int i = 0; i < 10; i++) {
+                write0.write(GenericRow.of(i, BinaryString.fromString("a" + i)));
+            }
+            BatchTableCommit commit = builder.newCommit();
+            commit.commit(write0.prepareCommit());
+        }
+
+        // Commit 2: writes f2 only, with row ids overlapping commit 1
+        long rowId = getTableDefault().snapshotManager().latestSnapshot().nextRowId() - 10;
+        builder = getTableDefault().newBatchWriteBuilder();
+        try (BatchTableWrite write1 = builder.newWrite().withWriteType(writeType1)) {
+            for (int i = 0; i < 10; i++) {
+                write1.write(GenericRow.of(BinaryString.fromString("b" + i)));
+            }
+            BatchTableCommit commit = builder.newCommit();
+            List<CommitMessage> commitables = write1.prepareCommit();
+            setFirstRowId(commitables, rowId);
+            commit.commit(commitables);
+        }
+
+        ReadBuilder readBuilder = getTableDefault().newReadBuilder();
+        List<DataSplit> splits =
+                readBuilder.newScan().plan().splits().stream()
+                        .map(s -> (DataSplit) s)
+                        .collect(Collectors.toList());
+        assertThat(splits.size()).isEqualTo(1);
+
+        SchemaManager schemaManager = getTableDefault().schemaManager();
+        SimpleStatsEvolutions evolutions =
+                new SimpleStatsEvolutions(
+                        id -> schemaManager.schema(id).fields(), schemaManager.latest().get().id());
+
+        DataField f0 = new DataField(0, "f0", DataTypes.INT());
+        DataField f1 = new DataField(1, "f1", DataTypes.STRING());
+        DataField f2 = new DataField(2, "f2", DataTypes.STRING());
+        DataSplit split = splits.get(0);
+
+        // each column is written by one file only; the other file contributes no stats
+        assertThat(split.minValue(0, f0, evolutions)).isEqualTo(0);
+        assertThat(split.maxValue(0, f0, evolutions)).isEqualTo(9);
+        assertThat(split.minValue(1, f1, evolutions)).isEqualTo(BinaryString.fromString("a0"));
+        assertThat(split.maxValue(1, f1, evolutions)).isEqualTo(BinaryString.fromString("a9"));
+        assertThat(split.minValue(2, f2, evolutions)).isEqualTo(BinaryString.fromString("b0"));
+        assertThat(split.maxValue(2, f2, evolutions)).isEqualTo(BinaryString.fromString("b9"));
+
+        // an unwritten column counts every row of that file as null
+        assertThat(split.nullCount(0, evolutions)).isEqualTo(10L);
+        assertThat(split.nullCount(1, evolutions)).isEqualTo(10L);
+        assertThat(split.nullCount(2, evolutions)).isEqualTo(10L);
     }
 
     @Test

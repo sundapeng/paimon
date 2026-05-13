@@ -209,7 +209,8 @@ public class DataSplit implements Split {
     public Object minValue(int fieldIndex, DataField dataField, SimpleStatsEvolutions evolutions) {
         Object minValue = null;
         for (DataFileMeta dataFile : dataFiles) {
-            SimpleStatsEvolution evolution = evolutions.getOrCreate(dataFile.schemaId());
+            SimpleStatsEvolution evolution =
+                    evolutions.getOrCreate(dataFile.schemaId(), dataFile.writeCols());
             InternalRow minValues =
                     evolution.evolution(
                             dataFile.valueStats().minValues(), dataFile.valueStatsCols());
@@ -228,7 +229,8 @@ public class DataSplit implements Split {
     public Object maxValue(int fieldIndex, DataField dataField, SimpleStatsEvolutions evolutions) {
         Object maxValue = null;
         for (DataFileMeta dataFile : dataFiles) {
-            SimpleStatsEvolution evolution = evolutions.getOrCreate(dataFile.schemaId());
+            SimpleStatsEvolution evolution =
+                    evolutions.getOrCreate(dataFile.schemaId(), dataFile.writeCols());
             InternalRow maxValues =
                     evolution.evolution(
                             dataFile.valueStats().maxValues(), dataFile.valueStatsCols());
@@ -247,7 +249,8 @@ public class DataSplit implements Split {
     public Long nullCount(int fieldIndex, SimpleStatsEvolutions evolutions) {
         Long sum = null;
         for (DataFileMeta dataFile : dataFiles) {
-            SimpleStatsEvolution evolution = evolutions.getOrCreate(dataFile.schemaId());
+            SimpleStatsEvolution evolution =
+                    evolutions.getOrCreate(dataFile.schemaId(), dataFile.writeCols());
             InternalArray nullCounts =
                     evolution.evolution(
                             dataFile.valueStats().nullCounts(),

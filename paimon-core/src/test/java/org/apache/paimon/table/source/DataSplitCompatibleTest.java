@@ -217,6 +217,143 @@ public class DataSplitCompatibleTest {
     }
 
     @Test
+    public void testSplitMinMaxWithWriteCols() {
+        Map<Long, List<DataField>> schemas = new HashMap<>();
+
+        DataField intField = new DataField(0, "c_int", new IntType());
+        DataField longField = new DataField(1, "c_long", new BigIntType());
+        DataField doubleField = new DataField(2, "c_double", new DoubleType());
+
+        // File 1 (schema 1): writes only c_int, c_long; valueStatsCols is null because the
+        // dense stats store records stats for every write column (SimpleStatsConverter).
+        BinaryRow min1 = newBinaryRow(new Object[] {10, 123L});
+        BinaryRow max1 = newBinaryRow(new Object[] {99, 456L});
+        SimpleStats valueStats1 = new SimpleStats(min1, max1, fromLongArray(new Long[] {0L, 0L}));
+        List<String> writeCols1 = Arrays.asList("c_int", "c_long");
+        DataFileMeta d1 =
+                DataFileMeta.forAppend(
+                        "file1",
+                        1024,
+                        100,
+                        valueStats1,
+                        0L,
+                        99L,
+                        1,
+                        Collections.emptyList(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        writeCols1);
+
+        // File 2 (schema 1): writes only c_int, c_double
+        BinaryRow min2 = newBinaryRow(new Object[] {5, 777.0D});
+        BinaryRow max2 = newBinaryRow(new Object[] {90, 999.0D});
+        SimpleStats valueStats2 = new SimpleStats(min2, max2, fromLongArray(new Long[] {0L, 0L}));
+        List<String> writeCols2 = Arrays.asList("c_int", "c_double");
+        DataFileMeta d2 =
+                DataFileMeta.forAppend(
+                        "file2",
+                        1024,
+                        100,
+                        valueStats2,
+                        0L,
+                        99L,
+                        1,
+                        Collections.emptyList(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        writeCols2);
+
+        DataSplit split = newDataSplit(true, Arrays.asList(d1, d2), null);
+
+        // Table schema has all 3 columns (data evolution)
+        schemas.put(1L, Arrays.asList(intField, longField, doubleField));
+        SimpleStatsEvolutions evolutions = new SimpleStatsEvolutions(schemas::get, 1);
+
+        // c_int is written by both files → min=5, max=99
+        assertThat(split.minValue(0, intField, evolutions)).isEqualTo(5);
+        assertThat(split.maxValue(0, intField, evolutions)).isEqualTo(99);
+
+        // c_long is only written by file1 → min=123, max=456; file2 has no data for c_long
+        assertThat(split.minValue(1, longField, evolutions)).isEqualTo(123L);
+        assertThat(split.maxValue(1, longField, evolutions)).isEqualTo(456L);
+
+        // c_double is only written by file2 → min=777, max=999; file1 has no data for c_double
+        assertThat(split.minValue(2, doubleField, evolutions)).isEqualTo(777D);
+        assertThat(split.maxValue(2, doubleField, evolutions)).isEqualTo(999D);
+    }
+
+    @Test
+    public void testSplitNullCountWithWriteCols() {
+        Map<Long, List<DataField>> schemas = new HashMap<>();
+
+        DataField intField = new DataField(0, "c_int", new IntType());
+        DataField longField = new DataField(1, "c_long", new BigIntType());
+        DataField doubleField = new DataField(2, "c_double", new DoubleType());
+
+        // File 1: writes only c_int, c_long; valueStatsCols is null (dense stats store)
+        BinaryRow min1 = newBinaryRow(new Object[] {10, 123L});
+        BinaryRow max1 = newBinaryRow(new Object[] {99, 456L});
+        SimpleStats valueStats1 = new SimpleStats(min1, max1, fromLongArray(new Long[] {2L, 3L}));
+        List<String> writeCols1 = Arrays.asList("c_int", "c_long");
+        DataFileMeta d1 =
+                DataFileMeta.forAppend(
+                        "file1",
+                        1024,
+                        100,
+                        valueStats1,
+                        0L,
+                        99L,
+                        1,
+                        Collections.emptyList(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        writeCols1);
+
+        // File 2: writes only c_int, c_double
+        BinaryRow min2 = newBinaryRow(new Object[] {5, 777.0D});
+        BinaryRow max2 = newBinaryRow(new Object[] {90, 999.0D});
+        SimpleStats valueStats2 = new SimpleStats(min2, max2, fromLongArray(new Long[] {1L, 4L}));
+        List<String> writeCols2 = Arrays.asList("c_int", "c_double");
+        DataFileMeta d2 =
+                DataFileMeta.forAppend(
+                        "file2",
+                        1024,
+                        100,
+                        valueStats2,
+                        0L,
+                        99L,
+                        1,
+                        Collections.emptyList(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        writeCols2);
+
+        DataSplit split = newDataSplit(true, Arrays.asList(d1, d2), null);
+
+        schemas.put(1L, Arrays.asList(intField, longField, doubleField));
+        SimpleStatsEvolutions evolutions = new SimpleStatsEvolutions(schemas::get, 1);
+
+        // c_int: written by both, nullCount = 2 + 1 = 3
+        assertThat(split.nullCount(0, evolutions)).isEqualTo(3);
+        // c_long: only in file1 (nullCount=3), file2 has no data so nullCount from file2 is 100
+        assertThat(split.nullCount(1, evolutions)).isEqualTo(103);
+        // c_double: only in file2 (nullCount=4), file1 has no data so nullCount from file1 is 100
+        assertThat(split.nullCount(2, evolutions)).isEqualTo(104);
+    }
+
+    @Test
     public void testSerializer() throws IOException {
         DataFileTestDataGenerator gen = DataFileTestDataGenerator.builder().build();
         DataFileTestDataGenerator.Data data = gen.next();

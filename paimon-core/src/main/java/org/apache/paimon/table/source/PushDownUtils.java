@@ -109,7 +109,8 @@ public class PushDownUtils {
                 if (file.rowCount() == 0) {
                     continue;
                 }
-                SimpleStatsEvolution evolution = evolutions.getOrCreate(file.schemaId());
+                SimpleStatsEvolution evolution =
+                        evolutions.getOrCreate(file.schemaId(), file.writeCols());
                 if (!evolvedMinMaxAvailable(evolution, field)) {
                     return false;
                 }

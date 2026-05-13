@@ -135,7 +135,8 @@ public class TopNDataSplitEvaluator {
         Long nullCount = null;
         boolean complete = true;
         for (DataFileMeta file : split.dataFiles()) {
-            SimpleStatsEvolution evolution = evolutions.getOrCreate(file.schemaId());
+            SimpleStatsEvolution evolution =
+                    evolutions.getOrCreate(file.schemaId(), file.writeCols());
             Long fileNullCount =
                     (Long)
                             InternalRowUtils.get(
