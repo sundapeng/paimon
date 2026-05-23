@@ -86,7 +86,11 @@ class SequentialReadStrategy implements ReadStrategy {
     @Override
     public void close() {
         if (nextFuture != null) {
-            nextFuture.cancel(true);
+            // CompletableFuture.cancel ignores mayInterruptIfRunning. A running supplier here calls
+            // inputStream.seek + IOUtils.readFully on a SeekableInputStream that is not guaranteed
+            // to be thread-safe, so we must wait for it to finish before BlockPrefetcher.close()
+            // closes the stream. Swallow any IO failure — we are shutting down.
+            nextFuture.exceptionally(e -> null).join();
             nextFuture = null;
         }
     }

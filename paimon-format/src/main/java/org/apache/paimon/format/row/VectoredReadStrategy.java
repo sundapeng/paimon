@@ -98,8 +98,12 @@ class VectoredReadStrategy implements ReadStrategy {
 
     @Override
     public void close() {
+        // CompletableFuture.cancel ignores mayInterruptIfRunning, so suppliers already running in
+        // IO_POOL would continue to touch the SeekableInputStream after BlockPrefetcher.close()
+        // closes it. Drain in-flight tasks (swallowing any IOException) so the stream is only
+        // closed after the last supplier has returned.
         for (CompletableFuture<byte[]> f : prefetchQueue) {
-            f.cancel(true);
+            f.exceptionally(e -> null).join();
         }
         prefetchQueue.clear();
     }

@@ -34,6 +34,7 @@ import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
+import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.FileRecordIterator;
@@ -68,6 +69,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -1362,6 +1365,91 @@ public class RowFormatReadWriteTest {
 
         // Should get 'b' values (100, 200), not 'a' values (10, 20)
         assertThat(results).containsExactlyInAnyOrder(100, 200);
+    }
+
+    @Test
+    public void testSequentialReadStrategyClosesOnlyAfterInflightDrains() throws Exception {
+        // A slow supplier must not race with stream close. After the fix, close() must wait
+        // for the running supplier to complete before returning, so an aliased close-then-read
+        // is impossible.
+        long[] compressedSizes = {16};
+        long[] uncompressedSizes = {16};
+        long[] rowStarts = {0};
+        RowBlockIndex index = new RowBlockIndex(compressedSizes, uncompressedSizes, rowStarts);
+
+        java.util.concurrent.CountDownLatch blockRead = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch readEntered =
+                new java.util.concurrent.CountDownLatch(1);
+        AtomicBoolean supplierFinished = new AtomicBoolean(false);
+        AtomicInteger streamClosed = new AtomicInteger(0);
+
+        SeekableInputStream slow =
+                new SeekableInputStream() {
+                    @Override
+                    public void seek(long desired) {}
+
+                    @Override
+                    public long getPos() {
+                        return 0;
+                    }
+
+                    @Override
+                    public int read(byte[] b, int off, int len) throws IOException {
+                        readEntered.countDown();
+                        try {
+                            blockRead.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("interrupted", e);
+                        }
+                        // Mimic real ZSTD-compressed payload of 16 bytes.
+                        for (int i = 0; i < len; i++) {
+                            b[off + i] = 0;
+                        }
+                        supplierFinished.set(true);
+                        return len;
+                    }
+
+                    @Override
+                    public int read() {
+                        return 0;
+                    }
+
+                    @Override
+                    public void close() {
+                        streamClosed.incrementAndGet();
+                    }
+                };
+
+        SequentialReadStrategy strategy = new SequentialReadStrategy(slow, index, new int[] {0});
+        // Wait until the prefetch supplier is actually executing inside read().
+        assertThat(readEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        // close() must block until the supplier returns. Run it on another thread to detect a hang
+        // and to ensure we observe the drain semantics.
+        Thread closer =
+                new Thread(
+                        () -> {
+                            try {
+                                strategy.close();
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+        closer.start();
+        // close() should still be running because the supplier hasn't been released yet.
+        Thread.sleep(100);
+        assertThat(closer.isAlive()).isTrue();
+        assertThat(supplierFinished.get()).isFalse();
+
+        // Release the read; close() should now finish promptly.
+        blockRead.countDown();
+        closer.join(5_000);
+        assertThat(closer.isAlive()).isFalse();
+        assertThat(supplierFinished.get()).isTrue();
+        // Strategy.close() does not own the stream; BlockPrefetcher closes it. Verify ordering by
+        // asserting the supplier finished before any subsequent close would have happened.
+        assertThat(streamClosed.get()).isEqualTo(0);
     }
 
     // ======================== Helpers ========================
