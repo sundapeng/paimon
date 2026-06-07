@@ -19,6 +19,7 @@
 package org.apache.paimon.fileindex.bsi;
 
 import org.apache.paimon.fileindex.FileIndexReader;
+import org.apache.paimon.fileindex.FileIndexResult;
 import org.apache.paimon.fileindex.FileIndexWriter;
 import org.apache.paimon.fileindex.bitmap.BitmapIndexResult;
 import org.apache.paimon.fs.ByteArraySeekableStream;
@@ -32,7 +33,6 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** test for {@link BitSliceIndexBitmapFileIndex}. */
 public class BitSliceIndexBitmapFileIndexTest {
@@ -260,8 +260,6 @@ public class BitSliceIndexBitmapFileIndexTest {
         BitSliceIndexBitmapFileIndex bsiFileIndex = new BitSliceIndexBitmapFileIndex(bigIntType);
         FileIndexWriter writer = bsiFileIndex.createWriter();
 
-        // Use values that include negative numbers but NOT Long.MIN_VALUE itself
-        // (since the writer cannot handle it). This isolates the reader-side bug.
         // Data: [-100, -1, null, 0, 1, 50]
         Object[] arr = {-100L, -1L, null, 0L, 1L, 50L};
 
@@ -274,61 +272,84 @@ public class BitSliceIndexBitmapFileIndexTest {
 
         // All non-null row ids: {0, 1, 3, 4, 5}
 
-        // x > Long.MIN_VALUE: every int64 value > Long.MIN_VALUE (since no row IS Long.MIN_VALUE),
-        // so result should be ALL non-null rows = {0, 1, 3, 4, 5}
+        // x > Long.MIN_VALUE: all indexed non-null rows are > Long.MIN_VALUE
         RoaringBitmap32 gtResult =
                 ((BitmapIndexResult) reader.visitGreaterThan(fieldRef, Long.MIN_VALUE)).get();
         assertThat(gtResult)
                 .as("x > Long.MIN_VALUE should return all non-null rows")
                 .isEqualTo(RoaringBitmap32.bitmapOf(0, 1, 3, 4, 5));
 
-        // x >= Long.MIN_VALUE: same — all non-null rows satisfy this
-        RoaringBitmap32 gteResult =
-                ((BitmapIndexResult) reader.visitGreaterOrEqual(fieldRef, Long.MIN_VALUE)).get();
-        assertThat(gteResult)
-                .as("x >= Long.MIN_VALUE should return all non-null rows")
-                .isEqualTo(RoaringBitmap32.bitmapOf(0, 1, 3, 4, 5));
+        // x >= Long.MIN_VALUE: since Long.MIN_VALUE cannot be indexed, the reader
+        // cannot determine which rows satisfy this — returns REMAIN
+        FileIndexResult gteResult = reader.visitGreaterOrEqual(fieldRef, Long.MIN_VALUE);
+        assertThat(gteResult.remain()).as("x >= Long.MIN_VALUE should return REMAIN").isTrue();
 
-        // x < Long.MIN_VALUE: no int64 value is less than Long.MIN_VALUE, so result should be
-        // empty
+        // x < Long.MIN_VALUE: no int64 value is less than Long.MIN_VALUE
         RoaringBitmap32 ltResult =
                 ((BitmapIndexResult) reader.visitLessThan(fieldRef, Long.MIN_VALUE)).get();
         assertThat(ltResult)
                 .as("x < Long.MIN_VALUE should return empty")
                 .isEqualTo(RoaringBitmap32.bitmapOf());
 
-        // x <= Long.MIN_VALUE: no row has Long.MIN_VALUE, so result should be empty
-        RoaringBitmap32 lteResult =
-                ((BitmapIndexResult) reader.visitLessOrEqual(fieldRef, Long.MIN_VALUE)).get();
-        assertThat(lteResult)
-                .as("x <= Long.MIN_VALUE should return empty (no row has that value)")
-                .isEqualTo(RoaringBitmap32.bitmapOf());
+        // x <= Long.MIN_VALUE: Long.MIN_VALUE is not indexed, so the reader cannot
+        // determine which rows satisfy this — returns REMAIN
+        FileIndexResult lteResult = reader.visitLessOrEqual(fieldRef, Long.MIN_VALUE);
+        assertThat(lteResult.remain()).as("x <= Long.MIN_VALUE should return REMAIN").isTrue();
 
-        // x == Long.MIN_VALUE: no row has Long.MIN_VALUE, so result should be empty
-        RoaringBitmap32 eqResult =
-                ((BitmapIndexResult) reader.visitEqual(fieldRef, Long.MIN_VALUE)).get();
-        assertThat(eqResult)
-                .as("x == Long.MIN_VALUE should return empty")
-                .isEqualTo(RoaringBitmap32.bitmapOf());
+        // x == Long.MIN_VALUE: Long.MIN_VALUE is not indexed — returns REMAIN
+        FileIndexResult eqResult = reader.visitEqual(fieldRef, Long.MIN_VALUE);
+        assertThat(eqResult.remain()).as("x == Long.MIN_VALUE should return REMAIN").isTrue();
 
-        // x != Long.MIN_VALUE: all non-null rows (no row has Long.MIN_VALUE)
-        RoaringBitmap32 neqResult =
-                ((BitmapIndexResult) reader.visitNotEqual(fieldRef, Long.MIN_VALUE)).get();
-        assertThat(neqResult)
-                .as("x != Long.MIN_VALUE should return all non-null rows")
-                .isEqualTo(RoaringBitmap32.bitmapOf(0, 1, 3, 4, 5));
+        // x != Long.MIN_VALUE: Long.MIN_VALUE is not indexed — returns REMAIN
+        FileIndexResult neqResult = reader.visitNotEqual(fieldRef, Long.MIN_VALUE);
+        assertThat(neqResult.remain()).as("x != Long.MIN_VALUE should return REMAIN").isTrue();
     }
 
     @Test
-    public void testWriterCannotHandleLongMinValue() {
+    public void testWriterSkipsLongMinValue() {
         BigIntType bigIntType = new BigIntType();
+        FieldRef fieldRef = new FieldRef(0, "", bigIntType);
         BitSliceIndexBitmapFileIndex bsiFileIndex = new BitSliceIndexBitmapFileIndex(bigIntType);
         FileIndexWriter writer = bsiFileIndex.createWriter();
-        writer.write(Long.MIN_VALUE);
 
-        assertThatThrownBy(writer::serializedBytes)
-                .isInstanceOf(RuntimeException.class)
-                .hasCauseInstanceOf(IllegalArgumentException.class)
-                .hasRootCauseMessage("values should be non-negative");
+        // Long.MIN_VALUE mixed with normal values — writer should not corrupt or fail
+        Object[] arr = {-100L, Long.MIN_VALUE, null, 0L, 1L, Long.MIN_VALUE, 50L};
+        for (Object o : arr) {
+            writer.write(o);
+        }
+
+        // Should succeed without exception
+        byte[] bytes = writer.serializedBytes();
+        ByteArraySeekableStream stream = new ByteArraySeekableStream(bytes);
+        FileIndexReader reader = bsiFileIndex.createReader(stream, 0, bytes.length);
+
+        // Normal values still indexed correctly
+        assertThat(((BitmapIndexResult) reader.visitEqual(fieldRef, 50L)).get())
+                .isEqualTo(RoaringBitmap32.bitmapOf(6));
+        assertThat(((BitmapIndexResult) reader.visitEqual(fieldRef, -100L)).get())
+                .isEqualTo(RoaringBitmap32.bitmapOf(0));
+        assertThat(((BitmapIndexResult) reader.visitEqual(fieldRef, 0L)).get())
+                .isEqualTo(RoaringBitmap32.bitmapOf(3));
+
+        // Long.MIN_VALUE predicates return REMAIN (cannot be determined from index)
+        assertThat(reader.visitEqual(fieldRef, Long.MIN_VALUE).remain()).isTrue();
+        assertThat(reader.visitLessOrEqual(fieldRef, Long.MIN_VALUE).remain()).isTrue();
+        assertThat(reader.visitGreaterOrEqual(fieldRef, Long.MIN_VALUE).remain()).isTrue();
+
+        // IS NULL: only row 2 is actually null; rows 1,5 have Long.MIN_VALUE but are
+        // treated as not-indexed (appear as null to BSI)
+        RoaringBitmap32 isNullBitmap = ((BitmapIndexResult) reader.visitIsNull(fieldRef)).get();
+        assertThat(isNullBitmap).isEqualTo(RoaringBitmap32.bitmapOf(1, 2, 5));
+
+        // IS NOT NULL: indexed rows only (Long.MIN_VALUE rows excluded from EBM)
+        RoaringBitmap32 isNotNullBitmap =
+                ((BitmapIndexResult) reader.visitIsNotNull(fieldRef)).get();
+        assertThat(isNotNullBitmap).isEqualTo(RoaringBitmap32.bitmapOf(0, 3, 4, 6));
+
+        // Range predicates on indexed values still work
+        assertThat(((BitmapIndexResult) reader.visitGreaterThan(fieldRef, 0L)).get())
+                .isEqualTo(RoaringBitmap32.bitmapOf(4, 6));
+        assertThat(((BitmapIndexResult) reader.visitLessThan(fieldRef, 0L)).get())
+                .isEqualTo(RoaringBitmap32.bitmapOf(0));
     }
 }
