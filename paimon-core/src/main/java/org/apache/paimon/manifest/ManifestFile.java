@@ -149,6 +149,7 @@ public class ManifestFile extends ObjectsFile<ManifestEntry> {
             writer.close();
             return writer.result();
         } catch (Exception e) {
+            writer.abort();
             throw new RuntimeException(e);
         }
     }

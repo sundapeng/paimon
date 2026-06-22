@@ -37,9 +37,6 @@ import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.RecordWriter;
 import org.apache.paimon.utils.SetUtils;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -54,8 +51,6 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** Data evolution table compaction task. */
 public class DataEvolutionCompactTask extends AppendCompactTask {
-
-    private static final Logger LOG = LoggerFactory.getLogger(DataEvolutionCompactTask.class);
 
     private static final Map<String, String> DYNAMIC_WRITE_OPTIONS =
             Collections.singletonMap(CoreOptions.TARGET_FILE_SIZE.key(), "99999 G");
@@ -108,31 +103,32 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
                         .withBucketPath(pathFactory.bucketPath(partition, 0).toString())
                         .rawConvertible(false)
                         .build();
-        RecordReader<InternalRow> reader =
-                store.newDataEvolutionRead().withReadType(readWriteType).createReader(dataSplit);
-        AppendFileStoreWrite storeWrite = (AppendFileStoreWrite) store.newWrite(commitUser);
-        storeWrite.withWriteType(readWriteType);
-        RecordWriter<InternalRow> writer = storeWrite.createWriter(partition, 0);
-
-        reader.forEachRemaining(
-                row -> {
-                    try {
-                        writer.write(row);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-        List<DataFileMeta> writeResult = writer.prepareCommit(false).newFilesIncrement().newFiles();
+        List<DataFileMeta> writeResult;
+        try (RecordReader<InternalRow> reader =
+                store.newDataEvolutionRead().withReadType(readWriteType).createReader(dataSplit)) {
+            AppendFileStoreWrite storeWrite = (AppendFileStoreWrite) store.newWrite(commitUser);
+            try {
+                storeWrite.withWriteType(readWriteType);
+                RecordWriter<InternalRow> writer = storeWrite.createWriter(partition, 0);
+                try {
+                    reader.forEachRemaining(
+                            row -> {
+                                try {
+                                    writer.write(row);
+                                } catch (Exception e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
+                    writeResult = writer.prepareCommit(false).newFilesIncrement().newFiles();
+                } finally {
+                    writer.close();
+                }
+            } finally {
+                storeWrite.close();
+            }
+        }
         checkArgument(
                 writeResult.size() == 1, "Data evolution compaction should produce one file.");
-
-        try {
-            writer.close();
-            storeWrite.close();
-        } catch (Exception e) {
-            LOG.warn("Failed to close reader and writer.", e);
-        }
 
         DataFileMeta dataFileMeta = writeResult.get(0).assignFirstRowId(firstRowId);
         long minSequenceId =

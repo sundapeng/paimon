@@ -177,6 +177,7 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
             writer.write(entries);
             writer.close();
         } catch (Exception e) {
+            writer.abort();
             throw new RuntimeException(e);
         }
         return writer.result();
