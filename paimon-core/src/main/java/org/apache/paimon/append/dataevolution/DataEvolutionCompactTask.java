@@ -133,20 +133,21 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
                         .withBucketPath(pathFactory.bucketPath(partition, 0).toString())
                         .rawConvertible(false)
                         .build();
-        RecordReader<InternalRow> reader =
-                store.newDataEvolutionRead().withReadType(readWriteType).createReader(dataSplit);
         AppendFileStoreWrite storeWrite = (AppendFileStoreWrite) store.newWrite(commitUser);
         storeWrite.withWriteType(readWriteType);
         RecordWriter<InternalRow> writer = storeWrite.createWriter(partition, 0);
 
-        reader.forEachRemaining(
-                row -> {
-                    try {
-                        writer.write(row);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
+        try (RecordReader<InternalRow> reader =
+                store.newDataEvolutionRead().withReadType(readWriteType).createReader(dataSplit)) {
+            reader.forEachRemaining(
+                    row -> {
+                        try {
+                            writer.write(row);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+        }
 
         List<DataFileMeta> writeResult = writer.prepareCommit(false).newFilesIncrement().newFiles();
         checkArgument(
@@ -156,7 +157,7 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
             writer.close();
             storeWrite.close();
         } catch (Exception e) {
-            LOG.warn("Failed to close reader and writer.", e);
+            LOG.warn("Failed to close writer.", e);
         }
 
         DataFileMeta dataFileMeta = writeResult.get(0).assignFirstRowId(firstRowId);
@@ -216,12 +217,11 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
                         .withBucketPath(pathFactory.parent().toString())
                         .rawConvertible(false)
                         .build();
-        RecordReader<InternalRow> reader =
-                store.newDataEvolutionRead().withReadType(blobWriteType).createReader(dataSplit);
         FileWriter<InternalRow, DataFileMeta> writer =
                 createBlobFileWriter(table, options, blobWriteType, blobField.name(), pathFactory);
 
-        try {
+        try (RecordReader<InternalRow> reader =
+                store.newDataEvolutionRead().withReadType(blobWriteType).createReader(dataSplit)) {
             reader.forEachRemaining(
                     row -> {
                         try {
