@@ -89,7 +89,8 @@ public class HttpClientUtils {
         HttpGet httpGet = new HttpGet(uri);
         CloseableHttpResponse response = DEFAULT_HTTP_CLIENT.execute(httpGet);
         if (response.getCode() != 200) {
-            throw new RuntimeException("HTTP error code: " + response.getCode());
+            response.close();
+            throw new IOException("HTTP error code: " + response.getCode());
         }
         return response.getEntity().getContent();
     }
