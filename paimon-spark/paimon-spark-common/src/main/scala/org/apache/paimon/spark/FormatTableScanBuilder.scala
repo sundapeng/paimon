@@ -22,11 +22,9 @@ import org.apache.paimon.table.FormatTable
 
 case class FormatTableScanBuilder(table: FormatTable) extends PaimonBaseScanBuilder {
 
+  // Format table data filters run after split planning, so a pushed limit can drop matching splits.
+  override def pushLimit(limit: Int): Boolean = false
+
   override def build(): PaimonFormatTableScan =
-    PaimonFormatTableScan(
-      table,
-      requiredSchema,
-      pushedPartitionFilters,
-      pushedDataFilters,
-      pushedLimit)
+    PaimonFormatTableScan(table, requiredSchema, pushedPartitionFilters, pushedDataFilters, None)
 }
