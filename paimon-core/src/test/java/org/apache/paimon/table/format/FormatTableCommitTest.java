@@ -218,14 +218,22 @@ class FormatTableCommitTest {
         Path partitionPath = new Path(tablePath, "year=2025/month=10");
         Path previousDataFile = new Path(partitionPath, "data-old.csv");
         fileIO.writeFile(previousDataFile, "1", false);
-        // A concurrent job is mid-write in this partition. Its files carry ordinary data file
-        // names; only the staging directories above them mark them as uncommitted.
-        Path stagingFile =
-                new Path(
-                        partitionPath,
-                        "__magic_job-6e7f/tasks/attempt_202607271200_0001_m_000010_15"
-                                + "/__base/part-00010.csv");
-        fileIO.writeFile(stagingFile, "2", false);
+        // Two concurrent jobs are mid-write in this partition, one under a magic committer's
+        // tree and one under the '_temporary' that Paimon's own writer also stages in. Their
+        // files carry ordinary data file names; only the directories above them say otherwise.
+        List<Path> stagingFiles =
+                Arrays.asList(
+                        new Path(
+                                partitionPath,
+                                "__magic_job-6e7f/tasks/attempt_202607271200_0001_m_000010_15"
+                                        + "/__base/part-00010.csv"),
+                        new Path(
+                                partitionPath,
+                                "_temporary/0/_temporary/attempt_202607271200_0001_m_000011_16"
+                                        + "/part-00011.csv"));
+        for (Path stagingFile : stagingFiles) {
+            fileIO.writeFile(stagingFile, "2", false);
+        }
 
         Path targetPath = new Path(partitionPath, "data-new.csv");
         RenamingTwoPhaseOutputStream outputStream =
@@ -252,7 +260,9 @@ class FormatTableCommitTest {
 
         assertThat(fileIO.exists(previousDataFile)).isFalse();
         assertThat(fileIO.exists(targetPath)).isTrue();
-        assertThat(fileIO.exists(stagingFile)).isTrue();
+        for (Path stagingFile : stagingFiles) {
+            assertThat(fileIO.exists(stagingFile)).isTrue();
+        }
     }
 
     @Test
