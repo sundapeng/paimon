@@ -128,7 +128,10 @@ public class FormatTableCommit implements BatchTableCommit {
                     partitionSpecs.add(staticPartitions);
                 }
                 if (overwrite) {
-                    deletePreviousDataFile(partitionPath);
+                    // A static partition may name only the leading keys, in which case the path is
+                    // a prefix and the partition directories of the remaining keys sit below it.
+                    deletePreviousDataFile(
+                            partitionPath, partitionKeys.size() - staticPartitions.size());
                 }
                 if (!fileIO.exists(partitionPath)) {
                     fileIO.mkdirs(partitionPath);
@@ -139,7 +142,8 @@ public class FormatTableCommit implements BatchTableCommit {
                     partitionPaths.add(c.targetPath().getParent());
                 }
                 for (Path p : partitionPaths) {
-                    deletePreviousDataFile(p);
+                    // The parent of a written file is always a complete partition directory.
+                    deletePreviousDataFile(p, 0);
                 }
             }
 
@@ -267,17 +271,18 @@ public class FormatTableCommit implements BatchTableCommit {
     @Override
     public void close() throws Exception {}
 
-    private void deletePreviousDataFile(Path partitionPath) throws IOException {
+    private void deletePreviousDataFile(Path partitionPath, int partitionLevels)
+            throws IOException {
         if (fileIO.exists(partitionPath)) {
-            FileStatus[] files = fileIO.listFiles(partitionPath, true);
-            for (FileStatus file : files) {
-                if (FormatTableScan.isDataFileName(file.getPath().getName())) {
-                    try {
-                        fileIO.delete(file.getPath(), false);
-                    } catch (FileNotFoundException ignore) {
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
+            // Committed data files only: what sits under a staging directory belongs to a writer
+            // that is still running.
+            for (FileStatus file :
+                    FormatTableScan.listDataFiles(fileIO, partitionPath, partitionLevels)) {
+                try {
+                    fileIO.delete(file.getPath(), false);
+                } catch (FileNotFoundException ignore) {
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
                 }
             }
         }

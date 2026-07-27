@@ -23,6 +23,8 @@ import org.apache.paimon.casting.CastExecutor;
 import org.apache.paimon.casting.CastExecutors;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.partition.PartitionPredicate;
@@ -48,6 +50,7 @@ import org.apache.paimon.utils.PartitionPathUtils;
 
 import javax.annotation.Nullable;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -99,7 +102,69 @@ public class FormatTableScan implements InnerTableScan {
     }
 
     public static boolean isDataFileName(String fileName) {
-        return fileName != null && !fileName.startsWith(".") && !fileName.startsWith("_");
+        return fileName != null && !PartitionPathUtils.isHiddenName(fileName);
+    }
+
+    /**
+     * Lists the data files under {@code listedRoot}, skipping committer staging trees ({@code
+     * _temporary/}, {@code __magic_job-<id>/}, {@code .hive-staging_*}) without descending into
+     * them. Files staged there carry ordinary data file names, so a name alone cannot tell them
+     * apart from committed data; the directory above them can.
+     *
+     * <p>Only entries below {@code listedRoot} are judged, never the root itself, which may
+     * legitimately sit under a warehouse path such as {@code oss://bucket/_warehouse/db/t}.
+     *
+     * @param partitionLevels how many directory levels below {@code listedRoot} hold partition
+     *     directories rather than table content. Those levels are descended whatever they are
+     *     named: a partition value may start with {@code '_'} — the default partition name does, in
+     *     the value-only layout, and {@link PartitionPathUtils} lets the scan read that partition —
+     *     so treating it as staging would leave its files behind. Pass 0 when {@code listedRoot} is
+     *     a single partition or an unpartitioned table.
+     * @throws FileNotFoundException if {@code listedRoot} does not exist; a directory that
+     *     disappears further down is skipped instead, leaving the rest of the listing complete
+     */
+    static List<FileStatus> listDataFiles(FileIO fileIO, Path listedRoot, int partitionLevels)
+            throws IOException {
+        List<FileStatus> dataFiles = new ArrayList<>();
+        List<Path> level = new ArrayList<>();
+        // A missing root is the caller's signal, e.g. a partition that the catalog knows but whose
+        // directory is gone, so let it surface.
+        collectDataFiles(fileIO.listStatus(listedRoot), partitionLevels >= 1, dataFiles, level);
+        for (int depth = 1; !level.isEmpty(); depth++) {
+            boolean childrenArePartitions = partitionLevels >= depth + 1;
+            List<Path> next = new ArrayList<>();
+            for (Path directory : level) {
+                try {
+                    collectDataFiles(
+                            fileIO.listStatus(directory), childrenArePartitions, dataFiles, next);
+                } catch (FileNotFoundException e) {
+                    // The directory vanished after its parent listed it; the rest of the listing
+                    // is still complete.
+                }
+            }
+            level = next;
+        }
+        return dataFiles;
+    }
+
+    private static void collectDataFiles(
+            @Nullable FileStatus[] children,
+            boolean childrenArePartitions,
+            List<FileStatus> dataFiles,
+            List<Path> directories) {
+        if (children == null) {
+            return;
+        }
+        for (FileStatus child : children) {
+            boolean hidden = PartitionPathUtils.isHiddenName(child.getPath().getName());
+            if (child.isDir()) {
+                if (childrenArePartitions || !hidden) {
+                    directories.add(child.getPath());
+                }
+            } else if (!hidden) {
+                dataFiles.add(child);
+            }
+        }
     }
 
     BinaryRow toPartitionRow(LinkedHashMap<String, String> partitionSpec) {

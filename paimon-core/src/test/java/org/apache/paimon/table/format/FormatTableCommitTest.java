@@ -37,6 +37,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.paimon.CoreOptions.PARTITION_DEFAULT_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
@@ -208,6 +209,103 @@ class FormatTableCommitTest {
                         "Partition value '..' cannot be used as a partition path component.");
         assertThat(fileIO.exists(tablePath)).isTrue();
         assertThat(fileIO.exists(siblingPath)).isTrue();
+    }
+
+    @Test
+    void testOverwriteKeepsFilesOfConcurrentWritersStagingTrees() throws Exception {
+        LocalFileIO fileIO = LocalFileIO.create();
+        Path tablePath = new Path(tempDir.toUri());
+        Path partitionPath = new Path(tablePath, "year=2025/month=10");
+        Path previousDataFile = new Path(partitionPath, "data-old.csv");
+        fileIO.writeFile(previousDataFile, "1", false);
+        // A concurrent job is mid-write in this partition. Its files carry ordinary data file
+        // names; only the staging directories above them mark them as uncommitted.
+        Path stagingFile =
+                new Path(
+                        partitionPath,
+                        "__magic_job-6e7f/tasks/attempt_202607271200_0001_m_000010_15"
+                                + "/__base/part-00010.csv");
+        fileIO.writeFile(stagingFile, "2", false);
+
+        Path targetPath = new Path(partitionPath, "data-new.csv");
+        RenamingTwoPhaseOutputStream outputStream =
+                new RenamingTwoPhaseOutputStream(fileIO, targetPath, false);
+        outputStream.write(1);
+        TwoPhaseOutputStream.Committer committer = outputStream.closeForCommit();
+        Map<String, String> staticPartition = new LinkedHashMap<>();
+        staticPartition.put("year", "2025");
+        staticPartition.put("month", "10");
+        FormatTableCommit commit =
+                new FormatTableCommit(
+                        tablePath.toString(),
+                        Arrays.asList("year", "month"),
+                        fileIO,
+                        false,
+                        true,
+                        Identifier.create("overwrite_db", "overwrite_table"),
+                        staticPartition,
+                        null,
+                        null,
+                        null);
+
+        commit.commit(Collections.singletonList(new TwoPhaseCommitMessage(committer)));
+
+        assertThat(fileIO.exists(previousDataFile)).isFalse();
+        assertThat(fileIO.exists(targetPath)).isTrue();
+        assertThat(fileIO.exists(stagingFile)).isTrue();
+    }
+
+    @Test
+    void testOverwritingAPrefixClearsTheDefaultPartitionDirectory() throws Exception {
+        LocalFileIO fileIO = LocalFileIO.create();
+        Path tablePath = new Path(tempDir.toUri());
+        // Value-only layout: the directory of a null partition value is the default partition
+        // name, which starts with '_' without being a staging directory. The scan reads it
+        // (PartitionPathUtils.isHiddenFile exempts it), so an overwrite has to clear it too.
+        Path defaultPartition =
+                new Path(tablePath, "2025/" + PARTITION_DEFAULT_NAME.defaultValue());
+        Path staleFile = new Path(defaultPartition, "data-old.csv");
+        fileIO.writeFile(staleFile, "1", false);
+        Path staleSibling = new Path(tablePath, "2025/10/data-old.csv");
+        fileIO.writeFile(staleSibling, "1", false);
+        Path stagedFile = new Path(defaultPartition, "__magic_job-6e7f/__base/part-00010.csv");
+        fileIO.writeFile(stagedFile, "2", false);
+
+        FormatTableCommit commit =
+                new FormatTableCommit(
+                        tablePath.toString(),
+                        Arrays.asList("year", "month"),
+                        fileIO,
+                        true,
+                        true,
+                        Identifier.create("overwrite_db", "overwrite_table"),
+                        Collections.singletonMap("year", "2025"),
+                        null,
+                        null,
+                        null);
+
+        commit.commit(Collections.emptyList());
+
+        assertThat(fileIO.exists(staleFile)).isFalse();
+        assertThat(fileIO.exists(staleSibling)).isFalse();
+        // Inside the partition, hidden still means staging.
+        assertThat(fileIO.exists(stagedFile)).isTrue();
+    }
+
+    @Test
+    void testCommitLeavesNoStagingDirectoryBehind() throws Exception {
+        LocalFileIO fileIO = LocalFileIO.create();
+        Path tablePath = new Path(tempDir.toUri());
+        Path partitionPath = new Path(tablePath, "year=2025/month=10");
+
+        commitPartitionedFile(tablePath, false, "year=2025/month=10");
+
+        // Nothing else was staged, so a plain commit leaves only its data file: callers that list
+        // the directory (and only skip '.'-prefixed names) must not trip over a leftover
+        // '_temporary'.
+        assertThat(fileIO.listStatus(partitionPath))
+                .extracting(status -> status.getPath().getName())
+                .containsExactly("data-1.csv");
     }
 
     private FormatTablePartitionManager commitPartitionedFile(
