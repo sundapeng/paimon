@@ -56,6 +56,7 @@ public class FormatTableCommit implements BatchTableCommit {
 
     private String location;
     private final boolean formatTablePartitionOnlyValueInPath;
+    private final String defaultPartName;
     private FileIO fileIO;
     private List<String> partitionKeys;
     protected Map<String, String> staticPartitions;
@@ -69,6 +70,7 @@ public class FormatTableCommit implements BatchTableCommit {
             List<String> partitionKeys,
             FileIO fileIO,
             boolean formatTablePartitionOnlyValueInPath,
+            String defaultPartName,
             boolean overwrite,
             Identifier tableIdentifier,
             @Nullable Map<String, String> staticPartitions,
@@ -78,6 +80,7 @@ public class FormatTableCommit implements BatchTableCommit {
         this.location = location;
         this.fileIO = fileIO;
         this.formatTablePartitionOnlyValueInPath = formatTablePartitionOnlyValueInPath;
+        this.defaultPartName = defaultPartName;
         validateStaticPartition(staticPartitions, partitionKeys);
         this.staticPartitions = staticPartitions;
         this.overwrite = overwrite;
@@ -277,7 +280,12 @@ public class FormatTableCommit implements BatchTableCommit {
             // Committed data files only: what sits under a staging directory belongs to a writer
             // that is still running.
             for (FileStatus file :
-                    FormatTableScan.listDataFiles(fileIO, partitionPath, partitionLevels)) {
+                    FormatTableScan.listDataFiles(
+                            fileIO,
+                            partitionPath,
+                            partitionLevels,
+                            formatTablePartitionOnlyValueInPath,
+                            defaultPartName)) {
                 try {
                     fileIO.delete(file.getPath(), false);
                 } catch (FileNotFoundException ignore) {

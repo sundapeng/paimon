@@ -110,7 +110,7 @@ abstract class SplitEnumerator {
         List<FormatDataSplit.FileMeta> segments = new ArrayList<>();
         // The listed directory is a single partition, or the table itself when unpartitioned:
         // no partition directories below it.
-        List<FileStatus> files = FormatTableScan.listDataFiles(fileIO, path, 0);
+        List<FileStatus> files = FormatTableScan.listDataFiles(fileIO, path);
         files.sort(Comparator.comparing(file -> file.getPath().toString()));
         for (FileStatus file : files) {
             segments.addAll(toSegments(file));

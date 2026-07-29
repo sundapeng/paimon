@@ -73,6 +73,7 @@ class FormatTableCommitTest {
                         Arrays.asList("year", "month"),
                         fileIO,
                         false,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
                         false,
                         Identifier.create("catalog_partition_db", "catalog_partition_table"),
                         null,
@@ -104,6 +105,7 @@ class FormatTableCommitTest {
                         Arrays.asList("year", "month"),
                         fileIO,
                         false,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
                         false,
                         Identifier.create("catalog_partition_db", "catalog_partition_table"),
                         null,
@@ -195,6 +197,7 @@ class FormatTableCommitTest {
                         Collections.singletonList("year"),
                         fileIO,
                         true,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
                         true,
                         Identifier.create("catalog_partition_db", "catalog_partition_table"),
                         staticPartition,
@@ -249,6 +252,7 @@ class FormatTableCommitTest {
                         Arrays.asList("year", "month"),
                         fileIO,
                         false,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
                         true,
                         Identifier.create("overwrite_db", "overwrite_table"),
                         staticPartition,
@@ -280,6 +284,11 @@ class FormatTableCommitTest {
         fileIO.writeFile(staleSibling, "1", false);
         Path stagedFile = new Path(defaultPartition, "__magic_job-6e7f/__base/part-00010.csv");
         fileIO.writeFile(stagedFile, "2", false);
+        // The exemption is that one directory name and no other: a staging tree standing next to
+        // the partition directories is still a staging tree.
+        Path stagedNextToThePartitions =
+                new Path(tablePath, "2025/_temporary/attempt/part-00011.csv");
+        fileIO.writeFile(stagedNextToThePartitions, "2", false);
 
         FormatTableCommit commit =
                 new FormatTableCommit(
@@ -287,6 +296,7 @@ class FormatTableCommitTest {
                         Arrays.asList("year", "month"),
                         fileIO,
                         true,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
                         true,
                         Identifier.create("overwrite_db", "overwrite_table"),
                         Collections.singletonMap("year", "2025"),
@@ -300,6 +310,56 @@ class FormatTableCommitTest {
         assertThat(fileIO.exists(staleSibling)).isFalse();
         // Inside the partition, hidden still means staging.
         assertThat(fileIO.exists(stagedFile)).isTrue();
+        assertThat(fileIO.exists(stagedNextToThePartitions)).isTrue();
+    }
+
+    @Test
+    void testOverwritingAPrefixKeepsStagingTreesSittingAtAPartitionLevel() throws Exception {
+        LocalFileIO fileIO = LocalFileIO.create();
+        Path tablePath = new Path(tempDir.toUri());
+        Path staticPrefix = new Path(tablePath, "year=2025");
+        Path staleFile = new Path(staticPrefix, "month=10/data-old.csv");
+        fileIO.writeFile(staleFile, "1", false);
+        // A concurrent job overwriting the same prefix with a dynamic month stages below the
+        // prefix itself, so its staging root stands where the month directories do rather than
+        // inside one of them. Being at a partition level does not make it partition data: the
+        // month directories it holds are the job's own, to be moved into place at its commit.
+        List<Path> stagingFiles =
+                Arrays.asList(
+                        new Path(staticPrefix, "_temporary/attempt/part.csv"),
+                        new Path(
+                                staticPrefix,
+                                "_temporary/0/attempt_202607271200_0001_m_000012_17"
+                                        + "/month=12/part-00012.csv"),
+                        new Path(
+                                staticPrefix,
+                                "_temporary/0/_temporary/attempt_202607271200_0001_m_000011_16"
+                                        + "/month=11/part-00011.csv"));
+        for (Path stagingFile : stagingFiles) {
+            fileIO.writeFile(stagingFile, "2", false);
+        }
+
+        // INSERT OVERWRITE ... PARTITION (year = '2025'), month left dynamic.
+        FormatTableCommit commit =
+                new FormatTableCommit(
+                        tablePath.toString(),
+                        Arrays.asList("year", "month"),
+                        fileIO,
+                        false,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
+                        true,
+                        Identifier.create("overwrite_db", "overwrite_table"),
+                        Collections.singletonMap("year", "2025"),
+                        null,
+                        null,
+                        null);
+
+        commit.commit(Collections.emptyList());
+
+        assertThat(fileIO.exists(staleFile)).isFalse();
+        for (Path stagingFile : stagingFiles) {
+            assertThat(fileIO.exists(stagingFile)).isTrue();
+        }
     }
 
     @Test
@@ -333,6 +393,7 @@ class FormatTableCommitTest {
                         Arrays.asList("year", "month"),
                         fileIO,
                         onlyValueInPath,
+                        PARTITION_DEFAULT_NAME.defaultValue(),
                         false,
                         Identifier.create("catalog_partition_db", "catalog_partition_table"),
                         null,
