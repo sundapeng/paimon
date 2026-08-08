@@ -19,16 +19,22 @@
 package org.apache.paimon.table.format;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.format.FileFormat;
+import org.apache.paimon.format.SimpleStatsExtractor;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.statistics.SimpleColStatsCollector;
 import org.apache.paimon.table.FormatTable;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.PartitionPathUtils;
 import org.apache.paimon.utils.ThreadPoolUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -38,6 +44,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -61,15 +68,35 @@ public class FormatTablePartitionStatsCollector {
     private static final Logger LOG =
             LoggerFactory.getLogger(FormatTablePartitionStatsCollector.class);
 
+    /** Row counts that need no columns: the file footer alone answers how many rows it holds. */
+    private static final RowType NO_COLUMNS = RowType.builder().build();
+
+    private static final SimpleColStatsCollector.Factory[] NO_COLLECTORS =
+            new SimpleColStatsCollector.Factory[0];
+
     private final FormatTable table;
 
     private final boolean onlyValueInPath;
     private final int parallelism;
 
+    private final boolean withRecordCount;
+
+    /** Measures from the listing alone, leaving the record count unknown. */
     public FormatTablePartitionStatsCollector(FormatTable table, int parallelism) {
+        this(table, false, parallelism);
+    }
+
+    /**
+     * Measures from the listing, and when {@code withRecordCount} is set also opens every file's
+     * footer for the rows it holds. That is the expensive half, so it is asked for rather than
+     * assumed.
+     */
+    public FormatTablePartitionStatsCollector(
+            FormatTable table, boolean withRecordCount, int parallelism) {
         this.table = table;
         this.onlyValueInPath =
                 new CoreOptions(table.options()).formatTablePartitionOnlyValueInPath();
+        this.withRecordCount = withRecordCount;
         this.parallelism = Math.max(1, parallelism);
     }
 
@@ -81,11 +108,19 @@ public class FormatTablePartitionStatsCollector {
         if (partitions.isEmpty()) {
             return Collections.emptyList();
         }
+        SimpleStatsExtractor rowCounter = withRecordCount ? rowCounter() : null;
+        if (withRecordCount && rowCounter == null) {
+            LOG.info(
+                    "Format {} of table {} carries no row count in its files, so the row counts of "
+                            + "the measured partitions stay unknown.",
+                    table.format(),
+                    table.fullName());
+        }
         int threads = Math.min(parallelism, partitions.size());
         if (threads == 1) {
             List<PartitionStatistics> statistics = new ArrayList<>(partitions.size());
             for (Map<String, String> partition : partitions) {
-                statistics.add(measure(partition));
+                statistics.add(measure(partition, rowCounter));
             }
             return statistics;
         }
@@ -95,7 +130,7 @@ public class FormatTablePartitionStatsCollector {
         try {
             List<Future<PartitionStatistics>> futures = new ArrayList<>(partitions.size());
             for (Map<String, String> partition : partitions) {
-                futures.add(executor.submit(() -> measure(partition)));
+                futures.add(executor.submit(() -> measure(partition, rowCounter)));
             }
             List<PartitionStatistics> statistics = new ArrayList<>(partitions.size());
             for (Future<PartitionStatistics> future : futures) {
@@ -116,7 +151,8 @@ public class FormatTablePartitionStatsCollector {
         }
     }
 
-    private PartitionStatistics measure(Map<String, String> partition) {
+    private PartitionStatistics measure(
+            Map<String, String> partition, @Nullable SimpleStatsExtractor rowCounter) {
         FileIO fileIO = table.fileIO();
         Path partitionPath = partitionPath(partition);
         List<FileStatus> files;
@@ -126,7 +162,7 @@ public class FormatTablePartitionStatsCollector {
             files = FormatTableScan.listDataFiles(fileIO, partitionPath);
         } catch (FileNotFoundException e) {
             // A registered partition whose directory is gone reads as empty.
-            return empty(partition);
+            return empty(partition, rowCounter);
         } catch (IOException e) {
             throw new UncheckedIOException(
                     String.format(
@@ -140,29 +176,86 @@ public class FormatTablePartitionStatsCollector {
         long fileCount = 0;
         long fileSizeInBytes = 0;
         long lastFileCreationTime = 0;
+        long recordCount = rowCounter == null ? PartitionStatistics.UNKNOWN : 0L;
         for (FileStatus file : files) {
             fileCount++;
             fileSizeInBytes += file.getLen();
             lastFileCreationTime = Math.max(lastFileCreationTime, file.getModificationTime());
+            if (PartitionStatistics.isKnown(recordCount)) {
+                long rows = rowCount(rowCounter, file);
+                recordCount =
+                        PartitionStatistics.isKnown(rows)
+                                ? recordCount + rows
+                                : PartitionStatistics.UNKNOWN;
+            }
         }
         if (fileCount == 0) {
-            return empty(partition);
+            return empty(partition, rowCounter);
         }
         return new PartitionStatistics(
                 partition,
-                // A listing never opens a file, so the rows a partition holds stay unknown.
-                PartitionStatistics.UNKNOWN,
+                recordCount,
                 fileSizeInBytes,
                 fileCount,
                 lastFileCreationTime,
                 PartitionStatistics.UNKNOWN_TOTAL_BUCKETS);
     }
 
+    /**
+     * Rows in one file, or unknown when its footer cannot be read. One unreadable file makes the
+     * whole partition unknown rather than short: a sum missing a file, reported as exact, is worse
+     * than no number at all.
+     */
+    private long rowCount(SimpleStatsExtractor rowCounter, FileStatus file) {
+        try {
+            return rowCounter
+                    .extractWithFileInfo(table.fileIO(), file.getPath(), file.getLen())
+                    .getRight()
+                    .getRowCount();
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to read the row count of {} in table {}; the row count of its "
+                            + "partition stays unknown.",
+                    file.getPath(),
+                    table.fullName(),
+                    e);
+            return PartitionStatistics.UNKNOWN;
+        }
+    }
+
+    /**
+     * A footer reader for this table's format, or null when the format carries no row count. It is
+     * built with no columns on purpose: only the file's row count is wanted, and asking for column
+     * statistics would both cost more and make the reader depend on the file schema matching the
+     * table's.
+     */
+    @Nullable
+    private SimpleStatsExtractor rowCounter() {
+        try {
+            CoreOptions options = new CoreOptions(table.options());
+            Optional<SimpleStatsExtractor> extractor =
+                    FileFormat.fileFormat(options).createStatsExtractor(NO_COLUMNS, NO_COLLECTORS);
+            return extractor.orElse(null);
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to create a row counter for format {} of table {}; row counts stay "
+                            + "unknown.",
+                    table.format(),
+                    table.fullName(),
+                    e);
+            return null;
+        }
+    }
+
     /** A partition with nothing in it: the file numbers are an exact zero. */
-    private static PartitionStatistics empty(Map<String, String> partition) {
+    private static PartitionStatistics empty(
+            Map<String, String> partition, @Nullable SimpleStatsExtractor rowCounter) {
         return new PartitionStatistics(
                 partition,
-                PartitionStatistics.UNKNOWN,
+                // Only a measurement that counts rows has learned that this partition holds none;
+                // a zero from one that never opens a file would outlive the emptiness, since the
+                // measurement after the files arrive reports unknown and unknown replaces nothing.
+                rowCounter == null ? PartitionStatistics.UNKNOWN : 0L,
                 0L,
                 0L,
                 PartitionStatistics.UNKNOWN,
