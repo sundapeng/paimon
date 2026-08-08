@@ -747,6 +747,12 @@ under the License.
             <td>Format table commit hive sync uri.</td>
         </tr>
         <tr>
+            <td><h5>format-table.commit.report-partition-statistics</h5></td>
+            <td style="word-wrap: break-word;">false</td>
+            <td>Boolean</td>
+            <td>Whether a format table commit reports the row count, file count and byte size it wrote to a catalog that manages its partitions. Off by default: such a report cannot be retried, so a 429 or 503 reaches the caller instead of being absorbed.</td>
+        </tr>
+        <tr>
             <td><h5>format-table.file.compression</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>String</td>

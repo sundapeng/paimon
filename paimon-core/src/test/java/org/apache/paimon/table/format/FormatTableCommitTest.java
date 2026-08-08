@@ -79,7 +79,8 @@ class FormatTableCommitTest {
                         null,
                         null,
                         null,
-                        partitionManager);
+                        partitionManager,
+                        false);
         CommitMessage message = new TwoPhaseCommitMessage(committer);
 
         assertThatThrownBy(() -> commit.commit(Collections.singletonList(message)))
@@ -111,7 +112,8 @@ class FormatTableCommitTest {
                         null,
                         null,
                         null,
-                        partitionManager);
+                        partitionManager,
+                        false);
         CommitMessage message = new TwoPhaseCommitMessage(committer);
 
         assertThatThrownBy(() -> commit.commit(Collections.singletonList(message)))
@@ -205,7 +207,8 @@ class FormatTableCommitTest {
                         staticPartition,
                         null,
                         null,
-                        null);
+                        null,
+                        false);
 
         commit.commit(Collections.singletonList(new TwoPhaseCommitMessage(committer)));
 
@@ -253,7 +256,8 @@ class FormatTableCommitTest {
                         Collections.singletonMap("year", "2025"),
                         null,
                         null,
-                        null);
+                        null,
+                        false);
 
         commit.commit(Collections.emptyList());
 
@@ -296,7 +300,8 @@ class FormatTableCommitTest {
                         Collections.singletonMap("year", "2025"),
                         null,
                         null,
-                        null);
+                        null,
+                        false);
 
         commit.commit(Collections.emptyList());
 
@@ -343,7 +348,8 @@ class FormatTableCommitTest {
                         staticPartition,
                         null,
                         null,
-                        null);
+                        null,
+                        false);
 
         assertThatThrownBy(() -> commit.commit(Collections.emptyList()))
                 .isInstanceOf(RuntimeException.class)
@@ -375,7 +381,8 @@ class FormatTableCommitTest {
                         null,
                         null,
                         null,
-                        partitionManager);
+                        partitionManager,
+                        false);
         commit.commit(Collections.singletonList(new TwoPhaseCommitMessage(committer)));
         return partitionManager;
     }

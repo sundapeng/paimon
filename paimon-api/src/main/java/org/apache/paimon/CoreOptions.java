@@ -2654,6 +2654,17 @@ public class CoreOptions implements Serializable {
                     .noDefaultValue()
                     .withDescription("Format table commit hive sync uri.");
 
+    public static final ConfigOption<Boolean> FORMAT_TABLE_COMMIT_REPORT_PARTITION_STATISTICS =
+            ConfigOptions.key("format-table.commit.report-partition-statistics")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether a format table commit reports the row count, file count and "
+                                    + "byte size it wrote to a catalog that manages its "
+                                    + "partitions. Off by default: such a report cannot be "
+                                    + "retried, so a 429 or 503 reaches the caller instead of "
+                                    + "being absorbed.");
+
     @Immutable
     public static final ConfigOption<String> BLOB_FIELD =
             key("blob-field")
@@ -3300,6 +3311,10 @@ public class CoreOptions implements Serializable {
 
     public String formatTableCommitSyncPartitionHiveUri() {
         return options.get(FORMAT_TABLE_COMMIT_HIVE_SYNC_URI);
+    }
+
+    public boolean formatTableCommitReportPartitionStatistics() {
+        return options.get(FORMAT_TABLE_COMMIT_REPORT_PARTITION_STATISTICS);
     }
 
     public MemorySize fileReaderAsyncThreshold() {
