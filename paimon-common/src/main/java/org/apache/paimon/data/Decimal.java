@@ -143,7 +143,9 @@ public final class Decimal implements Comparable<Decimal>, Serializable {
 
     @Override
     public int hashCode() {
-        return toBigDecimal().hashCode();
+        // Use normalized BigDecimal to ensure consistency with equals()
+        // which relies on compareTo that normalizes scale
+        return toBigDecimal().stripTrailingZeros().hashCode();
     }
 
     @Override

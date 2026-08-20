@@ -144,8 +144,23 @@ public abstract class HadoopCompliantFileIO implements FileIO {
         }
         FileSystem fs = map.get(authority);
         if (fs == null) {
-            fs = createFileSystem(path);
-            map.put(authority, fs);
+            FileSystem newFs = createFileSystem(path);
+            // Use putIfAbsent to handle race condition where multiple threads
+            // might create FileSystem instances for the same authority
+            FileSystem existingFs = map.putIfAbsent(authority, newFs);
+            if (existingFs != null) {
+                // Another thread already created a FileSystem for this authority
+                // Close our newly created instance to avoid resource leak
+                try {
+                    newFs.close();
+                } catch (IOException e) {
+                    // Log the error but don't fail the operation
+                    // The existing FileSystem is still usable
+                }
+                fs = existingFs;
+            } else {
+                fs = newFs;
+            }
         }
         return fs;
     }

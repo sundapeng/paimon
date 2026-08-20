@@ -325,12 +325,18 @@ public class FileIOUtils {
     private static void guardIfWindows(ThrowingConsumer<File, IOException> toRun, File file)
             throws IOException {
         synchronized (DELETE_LOCK) {
+            IOException lastException = null;
             for (int attempt = 1; attempt <= 10; attempt++) {
                 try {
                     toRun.accept(file);
                     break;
                 } catch (AccessDeniedException e) {
                     // ah, windows...
+                    lastException = e;
+                    if (attempt == 10) {
+                        // All attempts failed, throw the last exception
+                        throw lastException;
+                    }
                 }
 
                 // briefly wait and fall through the loop
