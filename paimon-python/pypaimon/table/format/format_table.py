@@ -18,8 +18,10 @@
 from enum import Enum
 from typing import Dict, List, Optional
 
+from pypaimon.catalog.catalog_environment import CatalogEnvironment
 from pypaimon.common.file_io import FileIO
 from pypaimon.common.identifier import Identifier
+from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.schema.table_schema import TableSchema
 from pypaimon.table.table import Table
 
@@ -53,6 +55,7 @@ class FormatTable(Table):
         format: Format,
         options: Optional[Dict[str, str]] = None,
         comment: Optional[str] = None,
+        catalog_environment: Optional[CatalogEnvironment] = None,
     ):
         self.file_io = file_io
         self.identifier = identifier
@@ -61,6 +64,7 @@ class FormatTable(Table):
         self._format = format
         self._options = options or dict(table_schema.options)
         self.comment = comment
+        self._catalog_environment = catalog_environment
         self.fields = table_schema.fields
         self.field_names = [f.name for f in self.fields]
         self.partition_keys = table_schema.partition_keys or []
@@ -88,6 +92,50 @@ class FormatTable(Table):
 
     def options(self) -> Dict[str, str]:
         return self._options
+
+    def _scan_catalog_for_custom_partition_location(self) -> bool:
+        catalog_environment = getattr(self, "_catalog_environment", None)
+        if catalog_environment is None:
+            return False
+        catalog = catalog_environment.catalog_loader.load()
+        page_token = None
+        seen_page_tokens = set()
+        path_key = CoreOptions.PATH.key()
+        while True:
+            page = catalog.list_partitions_paged(
+                self.identifier, max_results=1000, page_token=page_token
+            )
+            if page is None:
+                raise RuntimeError(
+                    "Catalog returned no partition page for "
+                    f"{self.full_name()}."
+                )
+            for partition in page.elements or []:
+                options = partition.options
+                if not options or path_key not in options:
+                    continue
+                if options[path_key] is None:
+                    raise RuntimeError(
+                        f"Partition path option must not be null for "
+                        f"{self.full_name()}."
+                    )
+                return True
+            page_token = page.next_page_token
+            if not page_token:
+                return False
+            if page_token in seen_page_tokens:
+                raise RuntimeError(
+                    f"Catalog repeated partition page token '{page_token}' "
+                    f"for {self.full_name()}."
+                )
+            seen_page_tokens.add(page_token)
+
+    def _reject_if_custom_partition_location_exists(self, operation: str) -> None:
+        if self._scan_catalog_for_custom_partition_location():
+            raise NotImplementedError(
+                f"PyPaimon cannot {operation} a Format Table with custom "
+                "partition locations."
+            )
 
     def new_read_builder(self):
         from pypaimon.table.format.format_read_builder import FormatReadBuilder

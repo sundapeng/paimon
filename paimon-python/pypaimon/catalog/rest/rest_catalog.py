@@ -730,6 +730,30 @@ class RESTCatalog(Catalog):
         location = schema.options.get(CoreOptions.PATH.key())
         if not location:
             raise ValueError("Format table schema must have path option")
+        catalog_environment = None
+        catalog_managed = str(
+            schema.options.get("metastore.partitioned-table", "false")
+        ).lower() == "true"
+        if catalog_managed:
+            if metadata.is_external:
+                raise ValueError(
+                    "Catalog-managed Format Table partitions require an "
+                    "internal table."
+                )
+            if str(
+                schema.options.get("format-table.implementation", "paimon")
+            ).lower() == "engine":
+                raise ValueError(
+                    "Catalog-managed Format Table partitions do not support "
+                    "format-table.implementation=engine."
+                )
+            if schema.partition_keys:
+                catalog_environment = CatalogEnvironment(
+                    identifier=identifier,
+                    uuid=metadata.uuid,
+                    catalog_loader=self.catalog_loader(),
+                    supports_version_management=True,
+                )
         data_file_io = external_file_io if metadata.is_external else internal_file_io
         file_io = data_file_io(location)
         file_format = schema.options.get(CoreOptions.FILE_FORMAT.key(), "parquet")
@@ -742,6 +766,7 @@ class RESTCatalog(Catalog):
             format=fmt,
             options=dict(schema.options),
             comment=schema.comment,
+            catalog_environment=catalog_environment,
         )
 
     def _create_iceberg_table(self,

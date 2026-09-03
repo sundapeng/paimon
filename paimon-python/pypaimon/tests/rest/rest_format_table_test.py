@@ -15,14 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 from parameterized import parameterized
 
 from pypaimon import Schema
+from pypaimon.api.api_response import Partition
 from pypaimon.catalog.catalog_exception import TableNotExistException
+from pypaimon.common.identifier import Identifier
+from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.table.format import FormatTable
 from pypaimon.tests.rest.rest_base_test import RESTBaseTest
 
@@ -35,6 +42,196 @@ def _format_table_read_write_formats():
 
 
 class RESTFormatTableTest(RESTBaseTest):
+
+    @staticmethod
+    def _write_parquet(path, values):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pq.write_table(
+            pa.table({"id": pa.array(values, type=pa.int32())}), path
+        )
+
+    def _create_catalog_partitioned_format_table(self, table_name):
+        schema = Schema.from_pyarrow_schema(
+            pa.schema([("id", pa.int32()), ("dt", pa.string())]),
+            partition_keys=["dt"],
+            options={
+                "type": "format-table",
+                "file.format": "parquet",
+                "metastore.partitioned-table": "true",
+            },
+        )
+        self.rest_catalog.create_table(table_name, schema, False)
+        return self.rest_catalog.get_table(table_name)
+
+    def test_catalog_managed_partitions_reject_unsupported_tables(self):
+        cases = [
+            ("external", {}, True, "internal table"),
+            (
+                "engine",
+                {"format-table.implementation": "engine"},
+                False,
+                "implementation=engine",
+            ),
+        ]
+        for suffix, extra_options, external, error in cases:
+            with self.subTest(suffix=suffix):
+                table_name = f"default.format_table_{suffix}_partitions"
+                options = {
+                    "type": "format-table",
+                    "file.format": "parquet",
+                    "metastore.partitioned-table": "true",
+                }
+                options.update(extra_options)
+                schema = Schema.from_pyarrow_schema(
+                    pa.schema([("id", pa.int32()), ("dt", pa.string())]),
+                    partition_keys=["dt"],
+                    options=options,
+                )
+                self.rest_catalog.create_table(table_name, schema, False)
+                identifier = Identifier.from_string(table_name)
+                if external:
+                    self.server.table_metadata_store[
+                        identifier.get_full_name()
+                    ]._is_external = True
+
+                with self.assertRaisesRegex(ValueError, error):
+                    self.rest_catalog.get_table(table_name)
+
+    def test_read_rejects_registered_custom_location_before_file_io(self):
+        table_name = "default.format_table_custom_location_read"
+        table = self._create_catalog_partitioned_format_table(table_name)
+        custom_dir = os.path.join(self.temp_dir, "custom", "dt=custom")
+        identifier = Identifier.from_string(table_name)
+        self.server.table_partitions_store[identifier.get_full_name()] = [
+            *[Partition(spec={"dt": f"{value:03d}"}) for value in range(100)],
+            Partition(
+                spec={"dt": "zzz"},
+                options={CoreOptions.PATH.key(): Path(custom_dir).as_uri()},
+            ),
+        ]
+
+        with patch.object(
+            table.file_io, "list_status", wraps=table.file_io.list_status
+        ), patch.object(
+            table.file_io,
+            "new_input_stream",
+            wraps=table.file_io.new_input_stream,
+        ) as read_file:
+            with self.assertRaisesRegex(
+                NotImplementedError, "custom partition locations"
+            ):
+                table.new_read_builder().new_scan().plan()
+            table.file_io.list_status.assert_not_called()
+            read_file.assert_not_called()
+
+    def test_write_rejects_any_registered_custom_location_before_file_io(self):
+        table_name = "default.format_table_custom_location_write"
+        table = self._create_catalog_partitioned_format_table(table_name)
+        identifier = Identifier.from_string(table_name)
+        custom_dir = os.path.join(self.temp_dir, "custom", "dt=custom")
+        registered = [
+            Partition(
+                spec={"dt": "custom"},
+                options={CoreOptions.PATH.key(): Path(custom_dir).as_uri()},
+            ),
+            Partition(spec={"dt": "default"}),
+        ]
+        self.server.table_partitions_store[identifier.get_full_name()] = list(
+            registered
+        )
+        default_dir = os.path.join(
+            self.warehouse,
+            "default",
+            "format_table_custom_location_write",
+            "dt=default",
+        )
+        sentinel = os.path.join(default_dir, "sentinel.parquet")
+        self._write_parquet(sentinel, [1])
+        table_write = (
+            table.new_batch_write_builder()
+            .overwrite({"dt": "default"})
+            .new_write()
+        )
+
+        with patch.object(
+            table.file_io,
+            "check_or_mkdirs",
+            wraps=table.file_io.check_or_mkdirs,
+        ) as mkdirs, patch.object(
+            table.file_io, "delete", wraps=table.file_io.delete
+        ) as delete, patch.object(
+            table.file_io,
+            "new_output_stream",
+            wraps=table.file_io.new_output_stream,
+        ) as output:
+            with self.assertRaisesRegex(
+                NotImplementedError, "custom partition locations"
+            ):
+                table_write.write_arrow(
+                    pa.table({"id": [3], "dt": ["default"]})
+                )
+            mkdirs.assert_not_called()
+            delete.assert_not_called()
+            output.assert_not_called()
+
+        self.assertTrue(os.path.exists(sentinel))
+        self.assertFalse(os.path.exists(custom_dir))
+        self.assertEqual(
+            [
+                (dict(partition.spec), partition.options)
+                for partition in self.server.table_partitions_store[
+                    identifier.get_full_name()
+                ]
+            ],
+            [
+                (dict(partition.spec), partition.options)
+                for partition in registered
+            ],
+        )
+
+        self.server.table_partitions_store[identifier.get_full_name()] = [
+            Partition(spec={"dt": "default"})
+        ]
+        default_write = table.new_batch_write_builder().new_write()
+        with patch.object(
+            table,
+            "_scan_catalog_for_custom_partition_location",
+            wraps=table._scan_catalog_for_custom_partition_location,
+        ) as custom_location_scan:
+            default_write.write_arrow_batch(
+                pa.record_batch({"id": [4], "dt": ["default"]})
+            )
+            default_write.write_arrow_batch(
+                pa.record_batch({"id": [5], "dt": ["default"]})
+            )
+            custom_location_scan.assert_called_once_with()
+        default_write.close()
+        self.assertGreater(len(os.listdir(default_dir)), 2)
+
+    def test_unrelated_partition_option_does_not_reject(self):
+        table_name = "default.format_table_unrelated_partition_option"
+        table = self._create_catalog_partitioned_format_table(table_name)
+        identifier = Identifier.from_string(table_name)
+        self.server.table_partitions_store[identifier.get_full_name()] = [
+            Partition(spec={"dt": "default"}, options={"owner": "alice"})
+        ]
+
+        self.assertFalse(table._scan_catalog_for_custom_partition_location())
+
+    def test_null_partition_path_fails_before_file_io(self):
+        table_name = "default.format_table_null_partition_path"
+        table = self._create_catalog_partitioned_format_table(table_name)
+        identifier = Identifier.from_string(table_name)
+        self.server.table_partitions_store[identifier.get_full_name()] = [
+            Partition(spec={"dt": "default"}, options={CoreOptions.PATH.key(): None})
+        ]
+
+        with patch.object(
+            table.file_io, "list_status", wraps=table.file_io.list_status
+        ) as list_status:
+            with self.assertRaisesRegex(RuntimeError, "path option must not be null"):
+                table.new_read_builder().new_scan().plan()
+            list_status.assert_not_called()
 
     @parameterized.expand(_format_table_read_write_formats())
     def test_format_table_read_write(self, file_format):

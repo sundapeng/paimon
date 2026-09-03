@@ -112,6 +112,7 @@ class FormatTableScan:
         partition_only_value = self.table.options().get(
             "format-table.partition-path-only-value", "false"
         ).lower() == "true"
+        self.table._reject_if_custom_partition_location_exists("read")
         splits = _list_data_files_recursive(
             self.table.file_io,
             self.table.location(),

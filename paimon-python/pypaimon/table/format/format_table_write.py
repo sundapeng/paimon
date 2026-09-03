@@ -95,6 +95,7 @@ class FormatTableWrite:
         )
         self._written_paths: List[str] = []
         self._overwritten_dirs: set = set()
+        self._custom_locations_checked = False
         opt = table.options().get(
             "format-table.partition-path-only-value", "false"
         )
@@ -130,6 +131,9 @@ class FormatTableWrite:
             self.write_arrow_batch(batch)
 
     def write_arrow_batch(self, data: pyarrow.RecordBatch) -> None:
+        if not self._custom_locations_checked:
+            self.table._reject_if_custom_partition_location_exists("write")
+            self._custom_locations_checked = True
         partition_keys = self.table.partition_keys
         if not partition_keys:
             part_spec = {}

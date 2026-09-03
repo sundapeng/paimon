@@ -19,7 +19,7 @@ import json
 import unittest
 
 from pypaimon.api.api_request import CreatePartitionsRequest
-from pypaimon.api.api_response import CreatePartitionsResponse
+from pypaimon.api.api_response import CreatePartitionsResponse, Partition
 from pypaimon.api.resource_paths import ResourcePaths
 from pypaimon.common.json_util import JSON
 
@@ -83,6 +83,46 @@ class CreatePartitionsResponseSerdeTest(unittest.TestCase):
         self.assertIsNone(response.existed)
 
 
+class PartitionSerdeTest(unittest.TestCase):
+
+    def test_from_json_reads_partition_options(self):
+        partition = JSON.from_json(
+            json.dumps({
+                "spec": {"dt": "20260807"},
+                "recordCount": 1,
+                "fileSizeInBytes": 2,
+                "fileCount": 1,
+                "lastFileCreationTime": 3,
+                "totalBuckets": -1,
+                "done": False,
+                "options": {
+                    "path": "file:/data/custom/dt=20260807",
+                    "owner": "alice",
+                },
+            }),
+            Partition,
+        )
+
+        self.assertEqual(
+            partition.options,
+            {
+                "path": "file:/data/custom/dt=20260807",
+                "owner": "alice",
+            },
+        )
+        serialized = json.loads(JSON.to_json(partition))
+        self.assertEqual(serialized["options"], partition.options)
+        self.assertNotIn("location", serialized)
+
+    def test_missing_options_remain_none(self):
+        partition = JSON.from_json(
+            json.dumps({"spec": {"dt": "20260807"}}), Partition
+        )
+
+        self.assertIsNone(partition.options)
+        self.assertNotIn("location", json.loads(JSON.to_json(partition)))
+
+
 class ResourcePathsPartitionsTest(unittest.TestCase):
 
     def test_partitions_collection_url(self):
@@ -98,6 +138,7 @@ class ResourcePathsPartitionsTest(unittest.TestCase):
             paths.partitions("my db", "my tbl"),
             "/v1/mock/databases/my%20db/tables/my%20tbl/partitions",
         )
+
 
 if __name__ == "__main__":
     unittest.main()
