@@ -180,6 +180,46 @@ public class IcebergCompatibilityTest {
     }
 
     @Test
+    public void testWithoutBaseRebuildDerivesOperationFromCommitKind() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType, Collections.emptyList(), Collections.singletonList("k"), 1);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        // wipe the Iceberg metadata directory, so the next commit rebuilds it without a base
+        table.fileIO().deleteDirectoryQuietly(new Path(table.location(), "metadata"));
+
+        // a pure compaction commit rebuilds the metadata from scratch; the snapshot summary
+        // must derive the operation from the commit kind instead of hardcoding "append"
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+        IcebergMetadata metadata =
+                IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new Path(table.location(), "metadata/v" + snapshotId + ".metadata.json"));
+        assertThat(metadata.currentSnapshot().summary().operation()).isEqualTo("replace");
+
+        // the rebuilt metadata still exposes the table data
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
     public void testDeletedEntryRecordsTheDeletingSnapshot() throws Exception {
         RowType rowType =
                 RowType.of(
