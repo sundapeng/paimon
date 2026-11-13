@@ -35,10 +35,12 @@ import org.apache.paimon.table.sink.CommitMessageImpl;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -65,6 +67,18 @@ public class BranchMergeHandler {
         Map<FileEntry.Identifier, ManifestEntry> files = new LinkedHashMap<>();
         FileEntry.mergeEntries(manifestFile, manifestList.readDataManifests(snapshot), files, null);
         return files;
+    }
+
+    /**
+     * Returns the {@link FileEntry.Identifier} set of {@link #readBranchFiles(String)}. Unlike
+     * {@code readBranchFiles(branch).keySet()}, the returned set does not pin the heavy {@link
+     * ManifestEntry} / {@link DataFileMeta} payloads, so callers that only need existence checks
+     * can release them before loading another branch.
+     */
+    public Set<FileEntry.Identifier> readBranchFileIds(String branch) {
+        Map<FileEntry.Identifier, ManifestEntry> files = readBranchFiles(branch);
+        // A keySet() view would keep the whole map reachable, so copy into a standalone set.
+        return new HashSet<>(files.keySet());
     }
 
     public void commit(String targetBranch, List<ManifestEntry> filesToMerge) {

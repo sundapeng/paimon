@@ -35,6 +35,7 @@ import org.apache.paimon.fileindex.bitmap.BitmapFileIndexFactory;
 import org.apache.paimon.fileindex.bloomfilter.BloomFilterFileIndexFactory;
 import org.apache.paimon.fileindex.bsi.BitSliceIndexBitmapFileIndexFactory;
 import org.apache.paimon.fileindex.rangebitmap.RangeBitmapFileIndexFactory;
+import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
@@ -92,12 +93,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -2192,6 +2195,155 @@ public class AppendOnlySimpleTableTest extends SimpleTableTestBase {
         handler.commit("main", filesToMerge);
         assertThatThrownBy(() -> handler.commit("main", filesToMerge))
                 .satisfies(anyCauseMatches(RuntimeException.class, "Trying to add file"));
+    }
+
+    @Test
+    public void testReadBranchFileIdsMatchesReadBranchFilesKeySetAndIsStandalone()
+            throws Exception {
+        // Guards the readBranchFileIds contract: same identifiers as readBranchFiles().keySet(),
+        // and a standalone set rather than a Map.keySet() view (a view would re-pin the whole
+        // entry map and defeat the computeMergeDiff footprint fix).
+        FileStoreTable table = createBranchMergeTable();
+        try (StreamTableWrite write = table.newWrite(commitUser);
+                StreamTableCommit commit = table.newCommit(commitUser)) {
+            write.write(rowData(0, 0, 0L));
+            write.write(rowData(1, 10, 100L));
+            commit.commit(0, write.prepareCommit(false, 1));
+        }
+        try (StreamTableWrite write = table.newWrite(commitUser);
+                StreamTableCommit commit = table.newCommit(commitUser)) {
+            write.write(rowData(2, 20, 200L));
+            commit.commit(1, write.prepareCommit(false, 2));
+        }
+
+        BranchMergeHandler handler = new BranchMergeHandler(table::switchToBranch);
+
+        Map<FileEntry.Identifier, ManifestEntry> files = handler.readBranchFiles("main");
+        assertThat(files).isNotEmpty();
+        Set<FileEntry.Identifier> expectedIds = new HashSet<>(files.keySet());
+
+        Set<FileEntry.Identifier> ids = handler.readBranchFileIds("main");
+        assertThat(ids).isEqualTo(expectedIds);
+
+        // Not a view: mutating the returned set must neither throw nor disturb later reads.
+        assertThat(ids).isInstanceOf(HashSet.class);
+        FileEntry.Identifier any = ids.iterator().next();
+        ids.remove(any);
+        assertThat(ids).doesNotContain(any);
+        assertThat(handler.readBranchFileIds("main")).isEqualTo(expectedIds);
+    }
+
+    @Test
+    public void testMergeBranchValidationAvoidsPerSnapshotExistenceChecks() throws Exception {
+        // The old validateCompleteAppendOnly probed every snapshot id 1..latest with
+        // fileIO.exists() before reading it, so validation cost 2 RPCs per snapshot per
+        // branch; the listing-based rewrite must not walk the history one id at a time.
+        // Hint-file lookups legitimately touch only boundary ids (earliest, latest + 1),
+        // so a probe on a strictly interior snapshot id means a per-id walk crept back in.
+        SnapshotExistsCountingFileIO fileIO = new SnapshotExistsCountingFileIO();
+        FileStoreTable table = createBranchMergeTableWithFileIO(fileIO);
+
+        try (StreamTableWrite write = table.newWrite(commitUser);
+                StreamTableCommit commit = table.newCommit(commitUser)) {
+            write.write(rowData(0, 0, 0L));
+            commit.commit(0, write.prepareCommit(false, 1));
+        }
+
+        // Branch forked from the very first snapshot keeps complete history, which mergeBranch
+        // requires; the tag must therefore be created at snapshot 1.
+        table.createTag("tag1", 1);
+        table.createBranch(BRANCH_NAME, "tag1");
+
+        for (int i = 1; i <= 3; i++) {
+            try (StreamTableWrite write = table.newWrite(commitUser);
+                    StreamTableCommit commit = table.newCommit(commitUser)) {
+                write.write(rowData(i, i * 10, (long) i * 100));
+                commit.commit(i, write.prepareCommit(false, i + 1));
+            }
+        }
+
+        FileStoreTable tableBranch = table.switchToBranch(BRANCH_NAME);
+        try (StreamTableWrite write = tableBranch.newWrite(commitUser);
+                StreamTableCommit commit = tableBranch.newCommit(commitUser)) {
+            write.write(rowData(5, 50, 500L));
+            commit.commit(5, write.prepareCommit(false, 6));
+        }
+
+        // Before the merge, main holds snapshots 1..4 and branch1 holds 1..2.
+        fileIO.startCounting();
+        table.mergeBranch(BRANCH_NAME, "main");
+        fileIO.stopCounting();
+
+        for (Path probe : fileIO.snapshotFileProbes()) {
+            boolean onBranch = probe.toString().contains("/branch/");
+            long latestBeforeMerge = onBranch ? 2 : 4;
+            long id = Long.parseLong(probe.getName().substring("snapshot-".length()));
+            assertThat(id <= Snapshot.FIRST_SNAPSHOT_ID || id > latestBeforeMerge)
+                    .as("mergeBranch must not probe snapshot %d one by one (%s)", id, probe)
+                    .isTrue();
+        }
+    }
+
+    private FileStoreTable createBranchMergeTableWithFileIO(FileIO fileIO) throws Exception {
+        Options conf = new Options();
+        conf.set(CoreOptions.PATH, tablePath.toString());
+        if (!conf.contains(BUCKET_KEY) && conf.get(BUCKET) != -1) {
+            conf.set(BUCKET_KEY, "a");
+        }
+        TableSchema tableSchema =
+                SchemaUtils.forceCommit(
+                        new FileSystemSchemaManager(LocalFileIO.create(), tablePath),
+                        new Schema(
+                                ROW_TYPE.getFields(),
+                                Collections.singletonList("pt"),
+                                Collections.emptyList(),
+                                conf.toMap(),
+                                ""));
+        return new AppendOnlyFileStoreTable(fileIO, tablePath, tableSchema);
+    }
+
+    /** LocalFileIO recording existence checks on individual {@code snapshot-N} files. */
+    private static final class SnapshotExistsCountingFileIO extends LocalFileIO {
+
+        private static final long serialVersionUID = 1L;
+
+        private transient boolean counting;
+
+        private final transient List<Path> snapshotFileProbes = new ArrayList<>();
+
+        void startCounting() {
+            counting = true;
+        }
+
+        void stopCounting() {
+            counting = false;
+        }
+
+        List<Path> snapshotFileProbes() {
+            return snapshotFileProbes;
+        }
+
+        @Override
+        public boolean exists(Path path) throws IOException {
+            if (counting && isSnapshotFile(path.getName())) {
+                synchronized (snapshotFileProbes) {
+                    snapshotFileProbes.add(path);
+                }
+            }
+            return super.exists(path);
+        }
+
+        private static boolean isSnapshotFile(String name) {
+            if (!name.startsWith("snapshot-")) {
+                return false;
+            }
+            for (int i = "snapshot-".length(); i < name.length(); i++) {
+                if (!Character.isDigit(name.charAt(i))) {
+                    return false;
+                }
+            }
+            return name.length() > "snapshot-".length();
+        }
     }
 
     @Test

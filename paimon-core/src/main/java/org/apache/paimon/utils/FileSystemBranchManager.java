@@ -34,8 +34,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -351,23 +353,50 @@ public class FileSystemBranchManager implements BranchManager {
                                     + "Branch merge requires complete append-only snapshot history.",
                             branch, Snapshot.FIRST_SNAPSHOT_ID, earliest));
         }
-        for (long id = Snapshot.FIRST_SNAPSHOT_ID; id <= latest; id++) {
-            if (!sm.snapshotExists(id)) {
+        // One directory listing replaces the per-id snapshotExists + snapshot loop (2 RPCs per
+        // snapshot, serial on object stores); gaps are caught by tracking the expected id.
+        Iterator<Snapshot> snapshots;
+        try {
+            snapshots = sm.snapshots();
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                    String.format("Failed to list snapshots on branch '%s'.", branch), e);
+        }
+        long expected = Snapshot.FIRST_SNAPSHOT_ID;
+        while (snapshots.hasNext()) {
+            Snapshot snapshot = snapshots.next();
+            if (snapshot.id() > latest) {
+                // A snapshot committed after 'latest' was read is outside the validated window;
+                // the old per-id loop stopped at 'latest' as well, so keep that contract.
+                break;
+            }
+            if (snapshot.id() != expected) {
                 throw new IllegalArgumentException(
                         String.format(
                                 "Cannot merge: snapshot %d is missing on branch '%s'. "
                                         + "Branch merge requires complete append-only snapshot history.",
-                                id, branch));
+                                expected, branch));
             }
-            Snapshot snapshot = sm.snapshot(id);
             Snapshot.CommitKind kind = snapshot.commitKind();
             if (kind != Snapshot.CommitKind.APPEND && kind != Snapshot.CommitKind.ANALYZE) {
                 throw new IllegalArgumentException(
                         String.format(
                                 "Cannot merge: snapshot %d on branch '%s' has commit kind '%s'. "
                                         + "Branch merge requires complete append-only snapshot history.",
-                                id, branch, kind));
+                                snapshot.id(), branch, kind));
             }
+            expected++;
+        }
+        // Fail loudly if the listing observed fewer snapshots than [earliest, latest] implies
+        // (e.g. expire-snapshot running concurrently) instead of committing a partial merge.
+        long observed = expected - Snapshot.FIRST_SNAPSHOT_ID;
+        long required = latest - Snapshot.FIRST_SNAPSHOT_ID + 1;
+        if (observed < required) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Cannot merge: snapshot %d is missing on branch '%s'. "
+                                    + "Branch merge requires complete append-only snapshot history.",
+                            expected, branch));
         }
     }
 
@@ -403,8 +432,9 @@ public class FileSystemBranchManager implements BranchManager {
     }
 
     private List<ManifestEntry> computeMergeDiff(String sourceBranch, String targetBranch) {
-        Set<FileEntry.Identifier> targetFileIds =
-                mergeHandler.readBranchFiles(targetBranch).keySet();
+        // Only the target's identifiers are needed, so let its full ManifestEntry / DataFileMeta
+        // payload be GC'd before the source branch's entries are materialized.
+        Set<FileEntry.Identifier> targetFileIds = mergeHandler.readBranchFileIds(targetBranch);
 
         Map<FileEntry.Identifier, ManifestEntry> sourceFiles =
                 mergeHandler.readBranchFiles(sourceBranch);
