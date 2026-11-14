@@ -1419,9 +1419,54 @@ public class IcebergRestMetadataCommitterTest {
                         Collections.emptyMap());
 
         IcebergRestMetadataCommitter committer = new IcebergRestMetadataCommitter(table);
-        committer.createDatabase();
-        committer.createDatabase();
+        TableIdentifier target = TableIdentifier.of(Namespace.of("mydb"), "t");
+        committer.createDatabase(target);
+        committer.createDatabase(target);
         assertThat(restCatalog.namespaceExists(Namespace.of("mydb"))).isTrue();
+    }
+
+    @Test
+    public void testSemicolonDatabaseListSyncsEachDatabase() throws Exception {
+        // 'metadata.iceberg.database=db1;db2' promises registration in each listed database,
+        // like the Hive committer; the list must not become one namespace named 'db1;db2'.
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.METASTORE_DATABASE.key(), "db1;db2");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        options);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        for (String database : new String[] {"db1", "db2"}) {
+            List<String> result = new ArrayList<>();
+            try (CloseableIterable<Record> records =
+                    IcebergGenerics.read(restCatalog.loadTable(TableIdentifier.of(database, "t")))
+                            .build()) {
+                for (Record record : records) {
+                    result.add(record.toString());
+                }
+            }
+            assertThat(result).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+        }
+        // the raw semicolon list must not leak into the catalog as a single namespace
+        assertThat(restCatalog.namespaceExists(Namespace.of("db1;db2"))).isFalse();
+
+        write.close();
+        commit.close();
     }
 
     @Test

@@ -88,8 +88,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     private final RESTCatalog restCatalog;
     private final FileIO fileIO;
     private final Path metadataDirectory;
-    private final String icebergDatabaseName;
-    private final TableIdentifier icebergTableIdentifier;
+    private final List<String> icebergDatabases;
+    private final String icebergTableName;
     private final IcebergOptions icebergOptions;
     private final int unknownHostMaxRetries;
     private final long unknownHostInitialRetryDelayMillis;
@@ -114,18 +114,14 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         this.metadataDirectory = IcebergCommitCallback.catalogTableMetadataPath(table);
 
         Identifier identifier = Preconditions.checkNotNull(table.catalogEnvironment().identifier());
-        String icebergDatabase = options.get(IcebergOptions.METASTORE_DATABASE);
+        this.icebergDatabases =
+                IcebergOptions.metastoreDatabases(options, identifier.getDatabaseName());
         String icebergTable = options.get(IcebergOptions.METASTORE_TABLE);
-        this.icebergDatabaseName =
-                icebergDatabase != null && !icebergDatabase.isEmpty()
-                        ? icebergDatabase
-                        : identifier.getDatabaseName();
         String icebergTableName =
                 icebergTable != null && !icebergTable.isEmpty()
                         ? icebergTable
                         : identifier.getTableName();
-        this.icebergTableIdentifier =
-                TableIdentifier.of(Namespace.of(icebergDatabaseName), icebergTableName);
+        this.icebergTableName = icebergTableName;
 
         Map<String, String> restConfigs = icebergOptions.icebergRestConfig();
 
@@ -136,7 +132,10 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
             this.restCatalog = initRestCatalog(restConfigs, hadoopConf);
         } catch (Exception e) {
             throw new RuntimeException(
-                    "Fail to initialize iceberg rest catalog for table: " + icebergTableIdentifier,
+                    "Fail to initialize iceberg rest catalog for table: "
+                            + icebergDatabases
+                            + "."
+                            + icebergTableName,
                     e);
         }
     }
@@ -167,7 +166,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 LOG.warn(
                         "Iceberg REST catalog DNS lookup failed for table {}; retrying in {} ms "
                                 + "({}/{}).",
-                        icebergTableIdentifier,
+                        icebergDatabases + "." + icebergTableName,
                         delayMillis,
                         retry + 1,
                         unknownHostMaxRetries,
@@ -185,7 +184,11 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
     private RuntimeException commitFailure(Exception cause) {
         return new RuntimeException(
-                "Fail to commit iceberg metadata for table: " + icebergTableIdentifier, cause);
+                "Fail to commit iceberg metadata for table: "
+                        + icebergDatabases
+                        + "."
+                        + icebergTableName,
+                cause);
     }
 
     @VisibleForTesting
@@ -209,30 +212,46 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         newIcebergMetadata = adjustMetadataForRest(newIcebergMetadata);
         TableMetadata newMetadata = TableMetadataParser.fromJson(newIcebergMetadata.toJson());
 
+        // 'metadata.iceberg.database' may list several databases; commit to each of them
+        for (String databaseName : icebergDatabases) {
+            commitMetadataForTarget(
+                    TableIdentifier.of(Namespace.of(databaseName), icebergTableName),
+                    newIcebergMetadata,
+                    newMetadata,
+                    baseIcebergMetadata);
+        }
+    }
+
+    private void commitMetadataForTarget(
+            TableIdentifier tableIdentifier,
+            IcebergMetadata newIcebergMetadata,
+            TableMetadata newMetadata,
+            @Nullable IcebergMetadata baseIcebergMetadata) {
+
         // updates to be committed
         TableMetadata.Builder updateBuilder;
 
         // create database if not exist
-        if (!databaseExists()) {
-            createDatabase();
+        if (!databaseExists(tableIdentifier)) {
+            createDatabase(tableIdentifier);
         }
 
         try {
-            if (!tableExists()) {
+            if (!tableExists(tableIdentifier)) {
                 if (requiresRegistration(newIcebergMetadata)) {
-                    LOG.info("Table {} does not exist, register it.", icebergTableIdentifier);
-                    registerAsCurrent(newIcebergMetadata, newMetadata, false);
+                    LOG.info("Table {} does not exist, register it.", tableIdentifier);
+                    registerAsCurrent(tableIdentifier, newIcebergMetadata, newMetadata, false);
                     return;
                 }
-                LOG.info("Table {} does not exist, create it.", icebergTableIdentifier);
-                icebergTable = createTable(newMetadata);
+                LOG.info("Table {} does not exist, create it.", tableIdentifier);
+                icebergTable = createTable(tableIdentifier, newMetadata);
                 updateBuilder =
                         updatesForCorrectBase(
                                 ((BaseTable) icebergTable).operations().current(),
                                 newMetadata,
                                 true);
             } else {
-                icebergTable = getTable();
+                icebergTable = getTable(tableIdentifier);
 
                 TableMetadata metadata = ((BaseTable) icebergTable).operations().current();
 
@@ -248,7 +267,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                     // through updatesForIncorrectBase would drop and recreate the table
                     LOG.info(
                             "Iceberg table {} is already at snapshot {}, nothing to commit.",
-                            icebergTableIdentifier,
+                            tableIdentifier,
                             newCurrent.snapshotId());
                     return;
                 }
@@ -263,11 +282,11 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                     // on a repeated commit failure would create an infinite drop+create loop.
                     LOG.info(
                             "Iceberg table {} exists but has no snapshots, treating as new table.",
-                            icebergTableIdentifier);
+                            tableIdentifier);
                     if (requiresRegistration(newIcebergMetadata)) {
                         // registration has no post-create commit step, so the drop+create
                         // failure loop this branch guards against cannot occur
-                        registerAsCurrent(newIcebergMetadata, newMetadata, true);
+                        registerAsCurrent(tableIdentifier, newIcebergMetadata, newMetadata, true);
                         return;
                     }
                     updateBuilder = updatesForCorrectBase(metadata, newMetadata, true);
@@ -287,16 +306,16 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                             LOG.info(
                                     "the base metadata is incorrect, re-registering the iceberg"
                                             + " table from local metadata.");
-                            registerAsCurrent(newIcebergMetadata, newMetadata, true);
+                            registerAsCurrent(
+                                    tableIdentifier, newIcebergMetadata, newMetadata, true);
                             return;
                         }
-                        updateBuilder = updatesForIncorrectBase(newMetadata);
+                        updateBuilder = updatesForIncorrectBase(tableIdentifier, newMetadata);
                     }
                 }
             }
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Fail to create table or get table: " + icebergTableIdentifier, e);
+            throw new RuntimeException("Fail to create table or get table: " + tableIdentifier, e);
         }
 
         TableMetadata updatedForCommit = updateBuilder.build();
@@ -311,8 +330,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                     .commit(((BaseTable) icebergTable).operations().current(), updatedForCommit);
         } catch (Exception e) {
             throw new RuntimeException(
-                    "Fail to commit metadata to rest catalog for table: " + icebergTableIdentifier,
-                    e);
+                    "Fail to commit metadata to rest catalog for table: " + tableIdentifier, e);
         }
     }
 
@@ -372,9 +390,10 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         return updateBuilder;
     }
 
-    private TableMetadata.Builder updatesForIncorrectBase(TableMetadata newMetadata) {
+    private TableMetadata.Builder updatesForIncorrectBase(
+            TableIdentifier tableIdentifier, TableMetadata newMetadata) {
         LOG.info("the base metadata is incorrect, we'll recreate the iceberg table.");
-        icebergTable = recreateTable(newMetadata);
+        icebergTable = recreateTable(tableIdentifier, newMetadata);
         return updatesForCorrectBase(
                 ((BaseTable) icebergTable).operations().current(), newMetadata, true);
     }
@@ -389,23 +408,23 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     // rest catalog invoke
     // -------------------------------------------------------------------------------------
 
-    private boolean databaseExists() {
-        return restCatalog.namespaceExists(Namespace.of(icebergDatabaseName));
+    private boolean databaseExists(TableIdentifier tableIdentifier) {
+        return restCatalog.namespaceExists(tableIdentifier.namespace());
     }
 
-    private boolean tableExists() {
-        return restCatalog.tableExists(icebergTableIdentifier);
+    private boolean tableExists(TableIdentifier tableIdentifier) {
+        return restCatalog.tableExists(tableIdentifier);
     }
 
     @VisibleForTesting
-    void createDatabase() {
+    void createDatabase(TableIdentifier tableIdentifier) {
         try {
-            restCatalog.createNamespace(Namespace.of(icebergDatabaseName));
+            restCatalog.createNamespace(tableIdentifier.namespace());
         } catch (AlreadyExistsException e) {
             // Benign check-then-act race: another commit created the namespace concurrently.
             LOG.info(
                     "Namespace {} already exists, created concurrently by another commit.",
-                    icebergDatabaseName);
+                    tableIdentifier.namespace());
         }
     }
 
@@ -435,9 +454,13 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
      * not support registration.
      */
     private void registerAsCurrent(
-            IcebergMetadata adjustedMetadata, TableMetadata newMetadata, boolean dropFirst) {
+            TableIdentifier tableIdentifier,
+            IcebergMetadata adjustedMetadata,
+            TableMetadata newMetadata,
+            boolean dropFirst) {
         if (!registerTableAdvertised()) {
             throw registerTableUnsupported(
+                    tableIdentifier,
                     "The Iceberg REST catalog does not advertise registerTable",
                     adjustedMetadata,
                     null);
@@ -445,21 +468,19 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         try {
             Path registerPath = writeRegisterFile(adjustedMetadata);
             if (dropFirst) {
-                if (probeRegisterTable(registerPath)) {
+                if (probeRegisterTable(tableIdentifier, registerPath)) {
                     // the table disappeared concurrently and the probe registered it
-                    verifyRegistered(newMetadata);
+                    verifyRegistered(tableIdentifier, newMetadata);
                     return;
                 }
-                dropTable();
+                dropTable(tableIdentifier);
             }
-            icebergTable =
-                    restCatalog.registerTable(icebergTableIdentifier, registerPath.toString());
-            verifyRegistered(newMetadata);
+            icebergTable = restCatalog.registerTable(tableIdentifier, registerPath.toString());
+            verifyRegistered(tableIdentifier, newMetadata);
         } catch (UnsupportedOperationException e) {
             throw e;
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Fail to register iceberg table " + icebergTableIdentifier, e);
+            throw new RuntimeException("Fail to register iceberg table " + tableIdentifier, e);
         }
     }
 
@@ -507,15 +528,15 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
      *
      * @return true if the registration went through because the table no longer existed
      */
-    private boolean probeRegisterTable(Path registerPath) {
+    private boolean probeRegisterTable(TableIdentifier tableIdentifier, Path registerPath) {
         try {
-            icebergTable =
-                    restCatalog.registerTable(icebergTableIdentifier, registerPath.toString());
+            icebergTable = restCatalog.registerTable(tableIdentifier, registerPath.toString());
             return true;
         } catch (AlreadyExistsException e) {
             return false;
         } catch (RuntimeException e) {
             throw registerTableUnsupported(
+                    tableIdentifier,
                     "registerTable against the existing Iceberg REST catalog table failed with "
                             + "something other than AlreadyExists, so the endpoint is assumed "
                             + "unsupported",
@@ -525,7 +546,10 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     }
 
     private UnsupportedOperationException registerTableUnsupported(
-            String reason, @Nullable IcebergMetadata metadata, @Nullable Throwable cause) {
+            TableIdentifier tableIdentifier,
+            String reason,
+            @Nullable IcebergMetadata metadata,
+            @Nullable Throwable cause) {
         return new UnsupportedOperationException(
                 String.format(
                         "%s; registerTable is required to publish format version 3 metadata "
@@ -538,7 +562,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                                         " (current snapshot first-row-id %s, next-row-id %s)",
                                         metadata.currentSnapshot().firstRowId(),
                                         metadata.nextRowId()),
-                        icebergTableIdentifier),
+                        tableIdentifier),
                 cause);
     }
 
@@ -560,7 +584,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         return registerPath;
     }
 
-    private void verifyRegistered(TableMetadata newMetadata) {
+    private void verifyRegistered(TableIdentifier tableIdentifier, TableMetadata newMetadata) {
         long registered =
                 ((BaseTable) icebergTable).operations().current().currentSnapshot().snapshotId();
         if (newMetadata.currentSnapshot() == null
@@ -572,11 +596,11 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                             newMetadata.currentSnapshot() == null
                                     ? "null"
                                     : newMetadata.currentSnapshot().snapshotId(),
-                            icebergTableIdentifier));
+                            tableIdentifier));
         }
     }
 
-    private Table createTable(TableMetadata newMetadata) {
+    private Table createTable(TableIdentifier tableIdentifier, TableMetadata newMetadata) {
         /*
         Handles fieldId incompatibility between Paimon (starts at 0) and Iceberg (starts at 1).
 
@@ -596,7 +620,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 LOG.info(
                         "Partition fieldId = 0. The Iceberg REST committer will use partition evolution to support Iceberg compatibility with the Paimon schema. If you want to avoid this, use a non-zero fieldId partition field");
             }
-            return createTable(new Schema(), null, newMetadata);
+            return createTable(tableIdentifier, new Schema(), null, newMetadata);
         } else {
             LOG.info(
                     "Partition fieldId > 0. In order to avoid partition evolution, dummy schema will be created first");
@@ -624,22 +648,26 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 columns[f.sourceId() - 1] = newMetadata.schema().findField(f.sourceId());
             }
 
-            return createTable(new Schema(columns), spec, newMetadata);
+            return createTable(tableIdentifier, new Schema(columns), spec, newMetadata);
         }
     }
 
     private Table createTable(
-            Schema schema, @Nullable PartitionSpec spec, TableMetadata newMetadata) {
+            TableIdentifier tableIdentifier,
+            Schema schema,
+            @Nullable PartitionSpec spec,
+            TableMetadata newMetadata) {
         try {
             // Path-based catalogs (e.g. Hadoop) derive and assign the table location themselves
             // and reject a custom one, so first try letting the catalog assign it.
-            return newTableBuilder(schema, spec, newMetadata.formatVersion()).create();
+            return newTableBuilder(tableIdentifier, schema, spec, newMetadata.formatVersion())
+                    .create();
         } catch (RuntimeException e) {
             // Some Iceberg REST catalogs (notably AWS Glue) do not auto-assign a table location
             // and reject creation without one. Retry with the location Paimon writes its metadata
             // to, normalised to the s3:// scheme such catalogs require.
             try {
-                return newTableBuilder(schema, spec, newMetadata.formatVersion())
+                return newTableBuilder(tableIdentifier, schema, spec, newMetadata.formatVersion())
                         .withLocation(toRestLocation(newMetadata.location()))
                         .create();
             } catch (RuntimeException retryError) {
@@ -650,10 +678,13 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     }
 
     private Catalog.TableBuilder newTableBuilder(
-            Schema schema, @Nullable PartitionSpec spec, int formatVersion) {
+            TableIdentifier tableIdentifier,
+            Schema schema,
+            @Nullable PartitionSpec spec,
+            int formatVersion) {
         Catalog.TableBuilder builder =
                 restCatalog
-                        .buildTable(icebergTableIdentifier, schema)
+                        .buildTable(tableIdentifier, schema)
                         .withProperty(
                                 TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
         return spec == null ? builder : builder.withPartitionSpec(spec);
@@ -673,23 +704,22 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         return location;
     }
 
-    private Table recreateTable(TableMetadata newMetadata) {
+    private Table recreateTable(TableIdentifier tableIdentifier, TableMetadata newMetadata) {
         try {
-            dropTable();
-            return createTable(newMetadata);
+            dropTable(tableIdentifier);
+            return createTable(tableIdentifier, newMetadata);
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Fail to recreate iceberg table: " + icebergTableIdentifier, e);
+            throw new RuntimeException("Fail to recreate iceberg table: " + tableIdentifier, e);
         }
     }
 
-    private Table getTable() {
-        return restCatalog.loadTable(icebergTableIdentifier);
+    private Table getTable(TableIdentifier tableIdentifier) {
+        return restCatalog.loadTable(tableIdentifier);
     }
 
-    private void dropTable() {
+    private void dropTable(TableIdentifier tableIdentifier) {
         // set purge to false, because we don't need to delete the data files
-        restCatalog.dropTable(icebergTableIdentifier, false);
+        restCatalog.dropTable(tableIdentifier, false);
     }
 
     // -------------------------------------------------------------------------------------
@@ -763,7 +793,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                                 "Ignoring custom Iceberg table property '{}' for table {}: "
                                         + "it collides with an Iceberg-reserved property.",
                                 key,
-                                icebergTableIdentifier);
+                                icebergDatabases + "." + icebergTableName);
                     } else {
                         filtered.put(key, value);
                     }
