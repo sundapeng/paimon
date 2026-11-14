@@ -575,6 +575,38 @@ public class EqualiserCodeGeneratorTest {
                 false);
     }
 
+    @Test
+    public void testIntKeyMapEqualiserComparesValuesOutsideIntegerCache() {
+        // Map key/value locals are declared with boxed classes; a generated
+        // == compares Integer references, which differs outside [-128, 127].
+        DataType mapType = DataTypes.MAP(DataTypes.INT(), DataTypes.INT());
+        RecordEqualiser equaliser =
+                new EqualiserCodeGenerator(new DataType[] {mapType})
+                        .generateRecordEqualiser("intKeyMapBoxedValueEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+
+        Map<Object, Object> leftMap = new LinkedHashMap<>();
+        leftMap.put(1, 1000);
+        leftMap.put(2, 2000);
+        Map<Object, Object> reversedMap = new LinkedHashMap<>();
+        reversedMap.put(2, 2000);
+        reversedMap.put(1, 1000);
+        assertMapEqualiser(
+                equaliser, mapType, new GenericMap(leftMap), new GenericMap(reversedMap), true);
+        assertMapEqualiser(
+                equaliser, mapType, new GenericMap(leftMap), new GenericMap(leftMap), true);
+
+        Map<Object, Object> differentValueMap = new LinkedHashMap<>();
+        differentValueMap.put(1, 1000);
+        differentValueMap.put(2, 2001);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(leftMap),
+                new GenericMap(differentValueMap),
+                false);
+    }
+
     private static Stream<DataType> nestedMapTypes() {
         DataType mapType = DataTypes.MAP(DataTypes.INT(), DataTypes.INT());
         DataType multisetType = DataTypes.MULTISET(DataTypes.INT());
@@ -591,14 +623,14 @@ public class EqualiserCodeGeneratorTest {
     @MethodSource("nestedMapTypes")
     public void testNestedMapEqualiserIgnoresEntryOrderInEveryRepresentation(DataType nestedType) {
         Map<Object, Object> map = new LinkedHashMap<>();
-        map.put(1, 10);
-        map.put(2, 20);
+        map.put(1, 1000);
+        map.put(2, 2000);
         Map<Object, Object> reversedMap = new LinkedHashMap<>();
-        reversedMap.put(2, 20);
-        reversedMap.put(1, 10);
+        reversedMap.put(2, 2000);
+        reversedMap.put(1, 1000);
         Map<Object, Object> otherMap = new LinkedHashMap<>();
-        otherMap.put(1, 10);
-        otherMap.put(2, 21);
+        otherMap.put(1, 1000);
+        otherMap.put(2, 2001);
 
         RecordEqualiser equaliser =
                 new EqualiserCodeGenerator(new DataType[] {nestedType})

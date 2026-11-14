@@ -2161,12 +2161,12 @@ public class FieldAggregatorTest {
                                                 "fields.fieldName.count-limit", "2")),
                                 "fieldName");
         Map<Object, Object> a = new LinkedHashMap<>();
-        a.put(1, 10);
-        a.put(2, 20);
+        a.put(1, 1000);
+        a.put(2, 2000);
         Map<Object, Object> b = new LinkedHashMap<>();
-        b.put(2, 20);
-        b.put(1, 10);
-        Map<Object, Object> c = Collections.singletonMap(3, 30);
+        b.put(2, 2000);
+        b.put(1, 1000);
+        Map<Object, Object> c = Collections.singletonMap(3, 3000);
         InternalArraySerializer serializer = new InternalArraySerializer(elementType);
         Object accumulator = null;
         for (Map<Object, Object> map : Arrays.asList(a, b, c)) {

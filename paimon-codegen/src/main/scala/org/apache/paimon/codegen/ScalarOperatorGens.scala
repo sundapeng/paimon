@@ -333,7 +333,7 @@ object ScalarOperatorGens {
         val entryTerm = newName("entry")
         val entryCls = classOf[java.util.Map.Entry[AnyRef, AnyRef]].getCanonicalName
         val valueEqualsExpr =
-          generateEquals(ctx, leftValueExpr, rightValueExpr, new BooleanType(valueType.isNullable))
+          generateMapValueEquals(ctx, leftValueExpr, rightValueExpr, valueType)
         val keyEqualsExpr =
           generateEquals(ctx, leftKeyExpr, rightKeyExpr, new BooleanType(keyType.isNullable))
 
@@ -515,6 +515,29 @@ object ScalarOperatorGens {
    */
   private def requiresElementWiseKeyMatch(keyType: DataType): Boolean =
     containsFloatingPoint(keyType) || isBinaryString(keyType) || !isComparable(keyType)
+
+  // Map key/value locals are declared with boxed classes, so a generated ==
+  // on integer-numeric or int-backed temporal values compares references.
+  private def generateMapValueEquals(
+      ctx: CodeGeneratorContext,
+      left: GeneratedExpression,
+      right: GeneratedExpression,
+      valueType: DataType): GeneratedExpression = {
+    val resultType = new BooleanType(valueType.isNullable)
+    if (boxedReferenceEquals(valueType)) {
+      generateOperatorIfNotNull(ctx, resultType, left, right)(
+        (leftTerm, rightTerm) => s"$leftTerm.equals($rightTerm)")
+    } else {
+      generateEquals(ctx, left, right, resultType)
+    }
+  }
+
+  private def boxedReferenceEquals(t: DataType): Boolean = t.getTypeRoot match {
+    case DataTypeRoot.TINYINT | DataTypeRoot.SMALLINT | DataTypeRoot.INTEGER | DataTypeRoot.BIGINT |
+        DataTypeRoot.DATE | DataTypeRoot.TIME_WITHOUT_TIME_ZONE =>
+      true
+    case _ => false
+  }
 
   // ----------------------------------------------------------------------------------------------
 }
