@@ -378,10 +378,10 @@ public class CompactAction extends TableActionBase {
         FileStoreTable fileStoreTable =
                 PostponeUtils.tableForPostponeRewrite(table, commitBucketNum, snapshotId);
         FixedBucketSink sink = new FixedBucketSink(fileStoreTable, null);
-        DataStream<Committable> dataStream = dataStreams.get(0);
-        for (int i = 1; i < dataStreams.size(); i++) {
-            dataStream = dataStream.union(dataStreams.get(i));
-        }
+        @SuppressWarnings("unchecked")
+        DataStream<Committable>[] rest =
+                dataStreams.subList(1, dataStreams.size()).toArray(new DataStream[0]);
+        DataStream<Committable> dataStream = dataStreams.get(0).union(rest);
         sink.doCommit(dataStream, commitUser);
         return true;
     }

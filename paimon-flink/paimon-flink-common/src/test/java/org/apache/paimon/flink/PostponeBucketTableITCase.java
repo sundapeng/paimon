@@ -22,6 +22,7 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.flink.action.CompactAction;
 import org.apache.paimon.flink.util.AbstractTestBase;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.index.DeletionVectorMeta;
@@ -30,7 +31,10 @@ import org.apache.paimon.table.FileStoreTable;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableList;
 
+import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.transformations.UnionTransformation;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.config.TableConfigOptions;
@@ -39,7 +43,9 @@ import org.apache.flink.util.CloseableIterator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -187,6 +193,76 @@ public class PostponeBucketTableITCase extends AbstractTestBase {
             expected.add(String.format("+I[%d, %d]", i, val));
         }
         assertThat(collect(tEnv.executeSql(query))).hasSameElementsAs(expected);
+    }
+
+    @Test
+    public void testCompactPlanWithManyPartitionsUsesFlatUnion() throws Exception {
+        String warehouse = getTempDirPath();
+        TableEnvironment tEnv =
+                tableEnvironmentBuilder()
+                        .batchMode()
+                        .setConf(TableConfigOptions.TABLE_DML_SYNC, true)
+                        .build();
+
+        tEnv.executeSql(
+                "CREATE CATALOG mycat WITH (\n"
+                        + "  'type' = 'paimon',\n"
+                        + "  'warehouse' = '"
+                        + warehouse
+                        + "'\n"
+                        + ")");
+        tEnv.executeSql("USE CATALOG mycat");
+        tEnv.executeSql(
+                "CREATE TABLE T (\n"
+                        + "  pt INT,\n"
+                        + "  k INT,\n"
+                        + "  v INT,\n"
+                        + "  PRIMARY KEY (pt, k) NOT ENFORCED\n"
+                        + ") PARTITIONED BY (pt) WITH (\n"
+                        + "  'bucket' = '-2',\n"
+                        + "  'postpone.batch-write-fixed-bucket' = 'false'\n"
+                        + ")");
+
+        // Each partition contributes two streams to the compact plan.
+        int numPartitions = 600;
+        List<String> values = new ArrayList<>();
+        for (int i = 0; i < numPartitions; i++) {
+            values.add(String.format("(%d, 0, %d)", i, i));
+        }
+        tEnv.executeSql("INSERT INTO T VALUES " + String.join(", ", values)).await();
+
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().batchMode().parallelism(1).build();
+        Map<String, String> catalogOptions = new HashMap<>();
+        catalogOptions.put("warehouse", warehouse);
+        CompactAction action = new CompactAction("default", "T", catalogOptions, new HashMap<>());
+        action.withStreamExecutionEnvironment(env);
+        action.build();
+
+        // Iterative DataStream#union creates one UnionTransformation per call, and job
+        // graph construction recurses over every nesting level, so a per-partition
+        // union loop blows the stack for many partitions. The plan must contain a
+        // single flat union instead.
+        List<UnionTransformation<?>> unions = new ArrayList<>();
+        Set<Transformation<?>> visited = new HashSet<>();
+        Deque<Transformation<?>> pending = new ArrayDeque<>(env.getTransformations());
+        while (!pending.isEmpty()) {
+            Transformation<?> transformation = pending.pollFirst();
+            if (!visited.add(transformation)) {
+                continue;
+            }
+            if (transformation instanceof UnionTransformation) {
+                unions.add((UnionTransformation<?>) transformation);
+            }
+            for (Transformation<?> input : transformation.getInputs()) {
+                pending.addLast(input);
+            }
+        }
+        assertThat(unions).hasSize(1);
+        assertThat(unions.get(0).getInputs())
+                .noneMatch(input -> input instanceof UnionTransformation);
+
+        assertThatCode(env::getStreamGraph).doesNotThrowAnyException();
     }
 
     @Test

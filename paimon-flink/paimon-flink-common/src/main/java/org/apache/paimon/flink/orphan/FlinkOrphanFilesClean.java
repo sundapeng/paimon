@@ -465,11 +465,15 @@ public class FlinkOrphanFilesClean extends OrphanFilesClean {
         }
 
         DataStream<CleanOrphanFilesResult> result = null;
-        for (DataStream<CleanOrphanFilesResult> clean : orphanFilesCleans) {
-            if (result == null) {
-                result = clean;
-            } else {
-                result = result.union(clean);
+        if (!orphanFilesCleans.isEmpty()) {
+            result = orphanFilesCleans.get(0);
+            if (orphanFilesCleans.size() > 1) {
+                @SuppressWarnings("unchecked")
+                DataStream<CleanOrphanFilesResult>[] rest =
+                        orphanFilesCleans
+                                .subList(1, orphanFilesCleans.size())
+                                .toArray(new DataStream[0]);
+                result = result.union(rest);
             }
         }
 

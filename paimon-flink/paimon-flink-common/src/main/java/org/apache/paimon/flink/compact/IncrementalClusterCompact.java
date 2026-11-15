@@ -325,10 +325,10 @@ public class IncrementalClusterCompact {
 
     protected void buildCommitOperator(List<DataStream<Committable>> dataStreams) {
         RowAppendTableSink sink = new RowAppendTableSink(table, null, null);
-        DataStream<Committable> dataStream = dataStreams.get(0);
-        for (int i = 1; i < dataStreams.size(); i++) {
-            dataStream = dataStream.union(dataStreams.get(i));
-        }
+        @SuppressWarnings("unchecked")
+        DataStream<Committable>[] rest =
+                dataStreams.subList(1, dataStreams.size()).toArray(new DataStream[0]);
+        DataStream<Committable> dataStream = dataStreams.get(0).union(rest);
         sink.doCommit(dataStream, commitUser);
     }
 }
