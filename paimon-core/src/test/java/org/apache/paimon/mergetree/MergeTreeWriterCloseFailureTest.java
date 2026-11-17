@@ -20,6 +20,8 @@ package org.apache.paimon.mergetree;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.KeyValue;
+import org.apache.paimon.compact.CompactManager;
+import org.apache.paimon.compact.CompactResult;
 import org.apache.paimon.compact.NoopCompactManager;
 import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.data.BinaryRow;
@@ -27,9 +29,12 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FlushingFileFormat;
+import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.PositionOutputStreamWrapper;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.KeyValueFileWriterFactory;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
 import org.apache.paimon.mergetree.compact.DeduplicateMergeFunction;
@@ -45,9 +50,18 @@ import org.apache.paimon.utils.TraceableFileIO;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static java.util.Collections.singletonList;
 import static org.apache.paimon.CoreOptions.ChangelogProducer.INPUT;
@@ -56,9 +70,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * {@link MergeTreeWriter#flushWriteBuffer} closes a changelog writer and a data writer in the same
- * {@code finally}. The data writer is a local, reachable from nowhere else once the method unwinds,
- * so a failing changelog close must not skip it.
+ * Failure-path tests for {@link MergeTreeWriter} resource release: the flush must not strand a
+ * local data writer behind a failing changelog close, and close must still release the compaction
+ * manager and delete uncommitted temporary files after the awaited compaction failed.
  */
 class MergeTreeWriterCloseFailureTest {
 
@@ -83,7 +97,56 @@ class MergeTreeWriterCloseFailureTest {
                 .isEmpty();
     }
 
+    @Test
+    void compactionManagerAndTempFilesAreReleasedWhenSyncFails() throws Exception {
+        Path path = new Path(tempDir.toString());
+        ExecutionException compactionFailure =
+                new ExecutionException(new IOException("Injected compaction failure"));
+        FailingSyncCompactManager manager = new FailingSyncCompactManager(compactionFailure, null);
+        MergeTreeWriter writer = createWriter(path, LocalFileIO.create(), manager);
+
+        // Overflow the write buffer so the memory-pressure flush writes uncommitted files.
+        for (int i = 0; i < 1000; i++) {
+            writer.write(kv(i, i * 10));
+        }
+        assertThat(filesIn()).isNotEmpty();
+
+        assertThatThrownBy(writer::close).isSameAs(compactionFailure);
+
+        // Before the fix sync() threw first, so the manager stayed open and every uncommitted
+        // data and changelog file stayed on storage.
+        assertThat(manager.closed).isTrue();
+        assertThat(filesIn()).isEmpty();
+    }
+
+    @Test
+    void managerCloseFailureIsSuppressedAfterSyncFailure() throws Exception {
+        Path path = new Path(tempDir.toString());
+        ExecutionException compactionFailure =
+                new ExecutionException(new IOException("Injected compaction failure"));
+        IOException closeFailure = new IOException("Injected manager close failure");
+        FailingSyncCompactManager manager =
+                new FailingSyncCompactManager(compactionFailure, closeFailure);
+        MergeTreeWriter writer = createWriter(path, LocalFileIO.create(), manager);
+
+        for (int i = 0; i < 1000; i++) {
+            writer.write(kv(i, i * 10));
+        }
+
+        assertThatThrownBy(writer::close)
+                .isSameAs(compactionFailure)
+                .satisfies(
+                        thrown ->
+                                assertThat(thrown.getSuppressed())
+                                        .extracting(Throwable::getMessage)
+                                        .containsExactly("Injected manager close failure"));
+    }
+
     private MergeTreeWriter createWriter(Path path) {
+        return createWriter(path, new CloseFailingFileIO(), new NoopCompactManager());
+    }
+
+    private MergeTreeWriter createWriter(Path path, FileIO fileIO, CompactManager compactManager) {
         RowType keyType = new RowType(singletonList(new DataField(0, "k", new IntType())));
         RowType valueType = new RowType(singletonList(new DataField(0, "v", new IntType())));
 
@@ -98,7 +161,7 @@ class MergeTreeWriterCloseFailureTest {
 
         KeyValueFileWriterFactory writerFactory =
                 KeyValueFileWriterFactory.builder(
-                                new CloseFailingFileIO(),
+                                fileIO,
                                 0,
                                 keyType,
                                 valueType,
@@ -115,7 +178,7 @@ class MergeTreeWriterCloseFailureTest {
                         128,
                         CompressOptions.defaultOptions(),
                         null,
-                        new NoopCompactManager(),
+                        compactManager,
                         -1L,
                         comparator,
                         DeduplicateMergeFunction.factory().create(),
@@ -133,6 +196,12 @@ class MergeTreeWriterCloseFailureTest {
         return new KeyValue().replace(GenericRow.of(k), RowKind.INSERT, GenericRow.of(v));
     }
 
+    private List<java.nio.file.Path> filesIn() throws IOException {
+        try (Stream<java.nio.file.Path> paths = Files.walk(tempDir)) {
+            return paths.filter(Files::isRegularFile).collect(Collectors.toList());
+        }
+    }
+
     /** Closes the underlying stream and then reports the failure, as a full disk would. */
     private static class CloseFailingFileIO extends TraceableFileIO {
 
@@ -145,6 +214,70 @@ class MergeTreeWriterCloseFailureTest {
                     throw new IOException("close failed for " + f.getName());
                 }
             };
+        }
+    }
+
+    /**
+     * Surfaces a failed compaction to the blocking sync in close, as a real manager does when its
+     * compaction task failed.
+     */
+    private static class FailingSyncCompactManager implements CompactManager {
+
+        private final ExecutionException compactionFailure;
+        @Nullable private final IOException closeFailure;
+
+        private boolean closed;
+
+        private FailingSyncCompactManager(
+                ExecutionException compactionFailure, @Nullable IOException closeFailure) {
+            this.compactionFailure = compactionFailure;
+            this.closeFailure = closeFailure;
+        }
+
+        @Override
+        public boolean shouldWaitForLatestCompaction() {
+            return false;
+        }
+
+        @Override
+        public boolean shouldWaitForPreparingCheckpoint() {
+            return false;
+        }
+
+        @Override
+        public void addNewFile(DataFileMeta file) {}
+
+        @Override
+        public List<DataFileMeta> allFiles() {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public void triggerCompaction(boolean fullCompaction) {}
+
+        @Override
+        public Optional<CompactResult> getCompactionResult(boolean blocking)
+                throws ExecutionException {
+            if (blocking) {
+                throw compactionFailure;
+            }
+            return Optional.empty();
+        }
+
+        @Override
+        public void cancelCompaction() {}
+
+        @Override
+        public boolean compactNotCompleted() {
+            return false;
+        }
+
+        @Override
+        public void close() throws IOException {
+            closed = true;
+            if (closeFailure != null) {
+                throw closeFailure;
+            }
         }
     }
 }

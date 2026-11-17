@@ -368,43 +368,50 @@ public class MergeTreeWriter implements RecordWriter<KeyValue>, MemoryOwner {
 
     @Override
     public void close() throws Exception {
-        writerFactory.abortManagedBlobWrites();
-        // cancel compaction so that it does not block job cancelling
-        compactManager.cancelCompaction();
-        sync();
-        compactManager.close();
+        // A failed sync() must not strand the compaction manager and the uncommitted
+        // temporary files, so every cleanup step runs and failures ride along suppressed.
+        IOUtils.closeAll(
+                writerFactory::abortManagedBlobWrites,
+                () -> {
+                    // cancel compaction so that it does not block job cancelling
+                    compactManager.cancelCompaction();
+                    sync();
+                },
+                compactManager::close,
+                () -> {
+                    // delete temporary files
+                    List<DataFileMeta> delete = new ArrayList<>(newFiles);
+                    newFiles.clear();
+                    deletedFiles.clear();
 
-        // delete temporary files
-        List<DataFileMeta> delete = new ArrayList<>(newFiles);
-        newFiles.clear();
-        deletedFiles.clear();
+                    for (DataFileMeta file : newFilesChangelog) {
+                        writerFactory.deleteFile(file);
+                    }
+                    newFilesChangelog.clear();
 
-        for (DataFileMeta file : newFilesChangelog) {
-            writerFactory.deleteFile(file);
-        }
-        newFilesChangelog.clear();
+                    for (DataFileMeta file : compactAfter) {
+                        // upgrade file is required by previous snapshot, so we should ensure
+                        // that this file is not the output of upgraded.
+                        if (!compactBefore.containsKey(file.fileName())) {
+                            delete.add(file);
+                        }
+                    }
 
-        for (DataFileMeta file : compactAfter) {
-            // upgrade file is required by previous snapshot, so we should ensure that this file is
-            // not the output of upgraded.
-            if (!compactBefore.containsKey(file.fileName())) {
-                delete.add(file);
-            }
-        }
+                    compactAfter.clear();
 
-        compactAfter.clear();
+                    for (DataFileMeta file : compactChangelog) {
+                        writerFactory.deleteFile(file);
+                    }
+                    compactChangelog.clear();
 
-        for (DataFileMeta file : compactChangelog) {
-            writerFactory.deleteFile(file);
-        }
-        compactChangelog.clear();
-
-        for (DataFileMeta file : delete) {
-            writerFactory.deleteFile(file);
-        }
-
-        if (compactDeletionFile != null) {
-            compactDeletionFile.clean();
-        }
+                    for (DataFileMeta file : delete) {
+                        writerFactory.deleteFile(file);
+                    }
+                },
+                () -> {
+                    if (compactDeletionFile != null) {
+                        compactDeletionFile.clean();
+                    }
+                });
     }
 }
