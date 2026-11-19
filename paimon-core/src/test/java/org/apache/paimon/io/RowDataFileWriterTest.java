@@ -467,6 +467,33 @@ class RowDataFileWriterTest {
     }
 
     @Test
+    void testIndexCloseFailureAbortsDataFile() throws Exception {
+        FileIO fileIO = fileIO();
+        IOException failure = new IOException("index spill failed");
+        when(fileIO.newOutputStream(dataFileToFileIndexPath(PATH), true)).thenThrow(failure);
+        Options options = new Options();
+        options.set("file-index.bitmap.columns", "id");
+        options.set("file-index.in-manifest-threshold", "0B");
+        FileIndexOptions indexOptions = new FileIndexOptions(new CoreOptions(options));
+        TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO,
+                        ROW_TYPE,
+                        formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        new LongCounter(),
+                        indexOptions);
+
+        writer.write(GenericRow.of(1));
+
+        assertThatThrownBy(writer::close).isSameAs(failure);
+        assertThat(formatWriter.closeCalls).isEqualTo(1);
+        verify(fileIO).deleteQuietly(PATH);
+        verify(fileIO, atLeastOnce()).deleteQuietly(dataFileToFileIndexPath(PATH));
+    }
+
+    @Test
     void testRowSidecarFallsBackToRows() throws Exception {
         FileIO fileIO = fileIO();
         TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();

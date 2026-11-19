@@ -214,9 +214,14 @@ public class KeyValueClusteringFileWriter
 
     @Override
     public void close() throws IOException {
-        if (dataFileIndexWriter != null) {
-            dataFileIndexWriter.close();
+        try {
+            if (dataFileIndexWriter != null) {
+                dataFileIndexWriter.close();
+            }
+            super.close();
+        } catch (IOException e) {
+            abort();
+            throw e;
         }
-        super.close();
     }
 }

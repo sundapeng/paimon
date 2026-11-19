@@ -163,10 +163,15 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
 
     @Override
     public void close() throws IOException {
-        for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
-            auxiliaryFileWriter.close();
+        try {
+            for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
+                auxiliaryFileWriter.close();
+            }
+            super.close();
+        } catch (IOException e) {
+            abort();
+            throw e;
         }
-        super.close();
     }
 
     @Override
