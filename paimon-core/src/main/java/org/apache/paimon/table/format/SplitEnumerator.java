@@ -85,7 +85,27 @@ abstract class SplitEnumerator {
         if (table.partitionKeys().isEmpty()) {
             return createSplits(table.fileIO(), new Path(table.location()), null);
         }
+        ensureNoFullScan(partitionFilter);
         return enumeratePartitions(partitionFilter);
+    }
+
+    /**
+     * Fails an unfiltered scan of a partitioned table before any partition is enumerated, when
+     * {@link CoreOptions#FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN} is disabled. Unlike the data-table
+     * check, which runs after planning, this fires ahead of the catalog listing and the directory
+     * listing, the exact work an accidental unfiltered query triggers.
+     */
+    final void ensureNoFullScan(@Nullable PartitionPredicate partitionFilter) {
+        if (partitionFilter != null || coreOptions.formatTableScanAllowFullScan()) {
+            return;
+        }
+        throw new RuntimeException(
+                String.format(
+                        "Full scan of partitioned Format Table %s is not allowed: the query "
+                                + "carries no partition filter, so every registered partition "
+                                + "would be enumerated. Add a partition filter, or enable it "
+                                + "with the option '%s'.",
+                        table.fullName(), CoreOptions.FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key()));
     }
 
     ScanPlan plan(@Nullable PartitionPredicate partitionFilter) throws IOException {

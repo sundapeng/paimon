@@ -885,6 +885,18 @@ under the License.
             <td>Format table file path only contain partition value.</td>
         </tr>
         <tr>
+            <td><h5>format-table.scan.allow-full-scan</h5></td>
+            <td style="word-wrap: break-word;">true</td>
+            <td>Boolean</td>
+            <td>Whether to allow scanning every partition of a partitioned Format Table when the query carries no partition filter. When disabled, such a scan fails before partitions are enumerated, instead of after the whole table has been planned on the driver.</td>
+        </tr>
+        <tr>
+            <td><h5>format-table.scan.full-scan-warn-threshold</h5></td>
+            <td style="word-wrap: break-word;">1000</td>
+            <td>Integer</td>
+            <td>Number of registered partitions beyond which an unfiltered scan of a catalog-managed Format Table logs a warning with the table name and partition count, before any file is listed. Non-positive values disable the warning.</td>
+        </tr>
+        <tr>
             <td><h5>format-table.scan.list-parallelism</h5></td>
             <td style="word-wrap: break-word;">64</td>
             <td>Integer</td>

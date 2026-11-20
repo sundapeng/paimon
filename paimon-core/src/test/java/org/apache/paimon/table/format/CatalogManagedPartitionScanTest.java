@@ -44,6 +44,11 @@ import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.JsonSerdeUtil;
 import org.apache.paimon.utils.PartitionPathUtils;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.Logger;
+import org.apache.logging.log4j.core.appender.OutputStreamAppender;
+import org.apache.logging.log4j.core.layout.PatternLayout;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -51,8 +56,10 @@ import org.mockito.ArgumentCaptor;
 
 import javax.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -67,6 +74,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH;
+import static org.apache.paimon.CoreOptions.FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN;
+import static org.apache.paimon.CoreOptions.FORMAT_TABLE_SCAN_FULL_SCAN_WARN_THRESHOLD;
 import static org.apache.paimon.CoreOptions.FORMAT_TABLE_SCAN_LIST_PARALLELISM;
 import static org.apache.paimon.CoreOptions.PATH;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -77,6 +86,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** Tests for Format Table scans whose partitions are catalog-managed. */
@@ -713,6 +723,169 @@ class CatalogManagedPartitionScanTest {
 
     private final List<Map<String, String>> requestedPrefixes = new ArrayList<>();
     private final List<Predicate> requestedFilters = new ArrayList<>();
+
+    @Test
+    void testUnfilteredCatalogScanFailsBeforePartitionEnumeration() throws Exception {
+        Catalog catalog = mock(Catalog.class);
+        TrackingLocalFileIO fileIO = new TrackingLocalFileIO();
+        Path tablePath = new Path(tempDir.toUri());
+        writeDataFile(fileIO, tablePath, "year=2025/month=11");
+        FormatTable table =
+                tableWithOptions(
+                        fileIO,
+                        tablePath,
+                        partitionManager(catalog),
+                        Collections.singletonMap(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key(), "false"));
+
+        assertThatThrownBy(() -> new FormatTableScan(table, null, null).plan().splits())
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Full scan of partitioned Format Table")
+                .hasMessageContaining(IDENTIFIER.getFullName())
+                .hasMessageContaining(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key());
+
+        verifyNoInteractions(catalog);
+        assertThat(fileIO.listedPaths).isEmpty();
+    }
+
+    @Test
+    void testUnfilteredFilesystemScanFailsBeforePartitionEnumeration() throws Exception {
+        TrackingLocalFileIO fileIO = new TrackingLocalFileIO();
+        Path tablePath = new Path(tempDir.toUri());
+        writeDataFile(fileIO, tablePath, "year=2025/month=10");
+        writeDataFile(fileIO, tablePath, "year=2025/month=11");
+        FormatTable table =
+                tableWithOptions(
+                        fileIO,
+                        tablePath,
+                        null,
+                        Collections.singletonMap(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key(), "false"));
+
+        assertThatThrownBy(() -> new FormatTableScan(table, null, null).plan().splits())
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key());
+        assertThat(fileIO.listedPaths).isEmpty();
+    }
+
+    @Test
+    void testFilteredCatalogScanSucceedsWithFullScanDisallowed() throws Exception {
+        TrackingLocalFileIO fileIO = new TrackingLocalFileIO();
+        Path tablePath = new Path(tempDir.toUri());
+        Path octoberFile = writeDataFile(fileIO, tablePath, "year=2025/month=10");
+        Path novemberFile = writeDataFile(fileIO, tablePath, "year=2025/month=11");
+        FormatTable table =
+                tableWithOptions(
+                        fileIO,
+                        tablePath,
+                        recordingCatalog(
+                                Arrays.asList(partition("2025", "10"), partition("2025", "11"))),
+                        Collections.singletonMap(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key(), "false"));
+        Predicate predicate = new PredicateBuilder(table.partitionType()).greaterThan(1, 10);
+        PartitionPredicate filter =
+                PartitionPredicate.fromPredicate(table.partitionType(), predicate);
+
+        List<Path> plannedFiles =
+                plannedFiles(new FormatTableScan(table, filter, null).plan().splits());
+
+        assertThat(plannedFiles).containsExactly(novemberFile);
+        assertThat(plannedFiles).doesNotContain(octoberFile);
+        assertThat(fileIO.listedPaths).containsExactly(new Path(tablePath, "year=2025/month=11"));
+    }
+
+    @Test
+    void testListPartitionEntriesIgnoresFullScanGuard() throws Exception {
+        TrackingLocalFileIO fileIO = new TrackingLocalFileIO();
+        Path tablePath = new Path(tempDir.toUri());
+        writeDataFile(fileIO, tablePath, "year=2025/month=10");
+        writeDataFile(fileIO, tablePath, "year=2025/month=11");
+        FormatTable table =
+                tableWithOptions(
+                        fileIO,
+                        tablePath,
+                        recordingCatalog(
+                                Arrays.asList(partition("2025", "10"), partition("2025", "11"))),
+                        Collections.singletonMap(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key(), "false"));
+
+        List<PartitionEntry> entries =
+                new FormatTableScan(table, null, null).listPartitionEntries();
+
+        assertThat(entries).hasSize(2);
+        assertThat(fileIO.listedPaths).isEmpty();
+    }
+
+    @Test
+    void testUnfilteredCatalogScanWarnsWhenListingManyPartitions() throws Exception {
+        TrackingLocalFileIO fileIO = new TrackingLocalFileIO();
+        Path tablePath = new Path(tempDir.toUri());
+        writeDataFile(fileIO, tablePath, "year=2025/month=10");
+        writeDataFile(fileIO, tablePath, "year=2025/month=11");
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put(FORMAT_TABLE_SCAN_FULL_SCAN_WARN_THRESHOLD.key(), "1");
+        FormatTable table =
+                tableWithOptions(
+                        fileIO,
+                        tablePath,
+                        recordingCatalog(
+                                Arrays.asList(partition("2025", "10"), partition("2025", "11"))),
+                        options);
+
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        OutputStreamAppender appender =
+                OutputStreamAppender.newBuilder()
+                        .setName("unfiltered-listing-warn-test")
+                        .setTarget(output)
+                        .setLayout(PatternLayout.newBuilder().withPattern("%level %msg%n").build())
+                        .build();
+        Logger logger = (Logger) LogManager.getLogger(CatalogSplitEnumerator.class);
+        Level previousLevel = logger.getLevel();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.WARN);
+        try {
+            plannedFiles(new FormatTableScan(table, null, null).plan().splits());
+            String unfilteredLogs = new String(output.toByteArray(), StandardCharsets.UTF_8);
+            assertThat(unfilteredLogs)
+                    .contains("Scanning format table " + IDENTIFIER.getFullName())
+                    .contains("all 2 registered partitions");
+
+            output.reset();
+            Predicate predicate = new PredicateBuilder(table.partitionType()).equal(1, 10);
+            PartitionPredicate filter =
+                    PartitionPredicate.fromPredicate(table.partitionType(), predicate);
+            plannedFiles(new FormatTableScan(table, filter, null).plan().splits());
+            assertThat(new String(output.toByteArray(), StandardCharsets.UTF_8))
+                    .doesNotContain("without a partition filter");
+        } finally {
+            logger.setLevel(previousLevel);
+            logger.removeAppender(appender);
+            appender.stop();
+        }
+    }
+
+    private FormatTable tableWithOptions(
+            LocalFileIO fileIO,
+            Path tablePath,
+            @Nullable FormatTablePartitionManager partitionManager,
+            Map<String, String> extraOptions) {
+        RowType rowType =
+                RowType.builder()
+                        .field("year", DataTypes.INT())
+                        .field("month", DataTypes.INT())
+                        .field("id", DataTypes.INT())
+                        .build();
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put(FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH.key(), "false");
+        options.putAll(extraOptions);
+        return FormatTable.builder()
+                .fileIO(fileIO)
+                .identifier(IDENTIFIER)
+                .rowType(rowType)
+                .partitionKeys(Arrays.asList("year", "month"))
+                .location(tablePath.toString())
+                .format(FormatTable.Format.CSV)
+                .options(options)
+                .partitionManager(partitionManager)
+                .build();
+    }
 
     private FormatTablePartitionManager partitionManager(Catalog catalog) {
         return FormatTablePartitionManager.create(

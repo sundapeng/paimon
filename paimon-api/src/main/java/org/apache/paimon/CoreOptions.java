@@ -1398,6 +1398,27 @@ public class CoreOptions implements Serializable {
                             "The parallelism of listing partition files during split planning for "
                                     + "a Format Table with catalog-managed partitions.");
 
+    public static final ConfigOption<Boolean> FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN =
+            key("format-table.scan.allow-full-scan")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether to allow scanning every partition of a partitioned Format "
+                                    + "Table when the query carries no partition filter. When "
+                                    + "disabled, such a scan fails before partitions are "
+                                    + "enumerated, instead of after the whole table has been "
+                                    + "planned on the driver.");
+
+    public static final ConfigOption<Integer> FORMAT_TABLE_SCAN_FULL_SCAN_WARN_THRESHOLD =
+            key("format-table.scan.full-scan-warn-threshold")
+                    .intType()
+                    .defaultValue(1000)
+                    .withDescription(
+                            "Number of registered partitions beyond which an unfiltered scan of "
+                                    + "a catalog-managed Format Table logs a warning with the "
+                                    + "table name and partition count, before any file is listed. "
+                                    + "Non-positive values disable the warning.");
+
     public static final ConfigOption<Duration> STREAMING_READ_SNAPSHOT_DELAY =
             key("streaming.read.snapshot.delay")
                     .durationType()
@@ -4353,6 +4374,14 @@ public class CoreOptions implements Serializable {
 
     public Integer formatTableScanListParallelism() {
         return options.get(FORMAT_TABLE_SCAN_LIST_PARALLELISM);
+    }
+
+    public boolean formatTableScanAllowFullScan() {
+        return options.get(FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN);
+    }
+
+    public Integer formatTableScanFullScanWarnThreshold() {
+        return options.get(FORMAT_TABLE_SCAN_FULL_SCAN_WARN_THRESHOLD);
     }
 
     public Integer scanBucket() {

@@ -90,6 +90,9 @@ final class CatalogSplitEnumerator extends SplitEnumerator {
     List<Split> enumeratePartitions(@Nullable PartitionPredicate partitionFilter)
             throws IOException {
         CatalogPartitionListing listing = findCatalogPartitions(partitionFilter);
+        if (partitionFilter == null) {
+            warnIfUnfilteredListingIsLarge(listing.partitions.size());
+        }
         return enumeratePartitions(
                 filterPartitions(listing.partitionPaths, partitionFilter), listing.formats);
     }
@@ -99,7 +102,11 @@ final class CatalogSplitEnumerator extends SplitEnumerator {
         if (table.partitionKeys().isEmpty()) {
             return super.plan(partitionFilter);
         }
+        ensureNoFullScan(partitionFilter);
         CatalogPartitionListing listing = findCatalogPartitions(partitionFilter);
+        if (partitionFilter == null) {
+            warnIfUnfilteredListingIsLarge(listing.partitions.size());
+        }
         List<Pair<LinkedHashMap<String, String>, Path>> selected =
                 filterPartitions(listing.partitionPaths, partitionFilter);
         List<PartitionEntry> entries = toPartitionEntries(listing.partitions, partitionFilter);
@@ -356,6 +363,27 @@ final class CatalogSplitEnumerator extends SplitEnumerator {
             normalized.put(partitionKey, value);
         }
         return normalized;
+    }
+
+    /**
+     * Warns when an unfiltered scan must enumerate far more partitions than a selective query
+     * would, right after the catalog listing and before any partition directory is listed. This is
+     * the log signature of a query that lost its partition filter, e.g. to a comment or to a
+     * pipeline that dropped the WHERE clause.
+     */
+    private void warnIfUnfilteredListingIsLarge(int partitionCount) {
+        int threshold = coreOptions.formatTableScanFullScanWarnThreshold();
+        if (threshold <= 0 || partitionCount <= threshold) {
+            return;
+        }
+        LOG.warn(
+                "Scanning format table {} without a partition filter: the driver will enumerate "
+                        + "all {} registered partitions and their files. If this is unintended, "
+                        + "add a partition filter to the query, or disable such scans with the "
+                        + "option '{}'.",
+                table.fullName(),
+                partitionCount,
+                CoreOptions.FORMAT_TABLE_SCAN_ALLOW_FULL_SCAN.key());
     }
 
     void warnIfFilesystemPartitionsExist() {
