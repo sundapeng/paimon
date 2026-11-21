@@ -363,6 +363,86 @@ class RewritePredicateIndicesUnitTest(unittest.TestCase):
         self.assertFalse(predicate_supports_arrow_filter(large))
         self.assertTrue(predicate_supports_arrow_filter(large_in))
 
+    def test_arrow_filter_support_accepts_all_allowlisted_methods(self):
+        from pypaimon.read.push_down_utils import predicate_supports_arrow_filter
+
+        pb = self._build_predicate()
+        safe_predicates = [
+            pb.equal('a', 1),
+            pb.not_equal('a', 1),
+            pb.less_than('a', 1),
+            pb.less_or_equal('a', 1),
+            pb.greater_than('a', 1),
+            pb.greater_or_equal('a', 1),
+            pb.is_in('a', [1, 2]),
+            pb.is_not_in('a', [1, 2]),
+            pb.between('a', 1, 2),
+            pb.not_between('a', 1, 2),
+            pb.is_null('a'),
+            pb.is_not_null('a'),
+        ]
+        for p in safe_predicates:
+            self.assertTrue(
+                predicate_supports_arrow_filter(p),
+                'method {!r} should support arrow filter'.format(p.method),
+            )
+
+    def test_arrow_filter_support_rejects_all_string_methods(self):
+        from pypaimon.read.push_down_utils import predicate_supports_arrow_filter
+
+        pb = self._build_predicate()
+        string_predicates = [
+            pb.startswith('b', 'x'),
+            pb.endswith('b', 'x'),
+            pb.contains('b', 'x'),
+            pb.like('b', 'x%'),
+        ]
+        for p in string_predicates:
+            self.assertFalse(
+                predicate_supports_arrow_filter(p),
+                'method {!r} must not support arrow filter'.format(p.method),
+            )
+
+    def test_arrow_filter_support_rejects_unknown_methods(self):
+        # A future predicate method whose to_arrow() falls back to a truthy
+        # expression (or None) must default to row-level filtering rather
+        # than silently returning unfiltered batches.
+        from pypaimon.common.predicate import Predicate
+        from pypaimon.read.push_down_utils import predicate_supports_arrow_filter
+
+        unknown = Predicate(
+            method='someFutureMethod', index=0, field='a', literals=[1]
+        )
+        self.assertFalse(predicate_supports_arrow_filter(unknown))
+
+    def test_arrow_filter_support_recurses_into_or(self):
+        from pypaimon.common.predicate import Predicate
+        from pypaimon.read.push_down_utils import predicate_supports_arrow_filter
+
+        pb = self._build_predicate()
+        all_safe = pb.or_predicates([pb.equal('a', 1), pb.is_null('c')])
+        self.assertTrue(predicate_supports_arrow_filter(all_safe))
+
+        with_string = pb.or_predicates([
+            pb.equal('a', 1),
+            pb.contains('b', 'x'),
+        ])
+        self.assertFalse(predicate_supports_arrow_filter(with_string))
+
+        unknown = Predicate(
+            method='someFutureMethod', index=0, field='a', literals=[1]
+        )
+        nested = pb.and_predicates([
+            pb.equal('a', 1),
+            pb.or_predicates([pb.equal('c', 2), unknown]),
+        ])
+        self.assertFalse(predicate_supports_arrow_filter(nested))
+
+    def test_arrow_filter_support_accepts_none_predicate(self):
+        from pypaimon.read.push_down_utils import predicate_supports_arrow_filter
+
+        self.assertTrue(predicate_supports_arrow_filter(None))
+
     def test_missing_first_row_id_materializes_null_row_ids(self):
         from pypaimon.execution.python.read.reader.data_file_batch_reader import (DataFileBatchReader)
         from pypaimon.table.special_fields import SpecialFields

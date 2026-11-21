@@ -21,11 +21,26 @@ from pypaimon.common.predicate import Predicate
 from pypaimon.common.predicate_builder import PredicateBuilder
 from pypaimon.schema.data_types import DataField
 
-_UNSAFE_ARROW_FILTER_METHODS = frozenset([
-    'startsWith',
-    'endsWith',
-    'contains',
-    'like',
+# Leaf predicate methods whose Predicate.to_arrow() builds a real dataset
+# expression, so filtering an Arrow batch with it keeps exactly the matching
+# rows. Methods absent from this set (startsWith/endsWith/contains/like today,
+# and any method added in the future) may fall back to a truthy expression or
+# None in to_arrow(); treating them as supported would make
+# FilterRecordBatchReader silently return unfiltered rows, so they must go
+# through row-level filtering instead.
+_SAFE_ARROW_FILTER_METHODS = frozenset([
+    'equal',
+    'notEqual',
+    'lessThan',
+    'lessOrEqual',
+    'greaterThan',
+    'greaterOrEqual',
+    'in',
+    'notIn',
+    'between',
+    'notBetween',
+    'isNull',
+    'isNotNull',
 ])
 
 # Large boolean trees can overflow or crash native Dataset scanners even when
@@ -190,8 +205,12 @@ def predicate_supports_arrow_filter(predicate: Optional[Predicate]) -> bool:
 
     PyArrow 6 accepts dataset expressions for comparisons, null checks, and
     isin, but string match compute functions do not accept dataset expressions.
-    Predicate.to_arrow() currently falls back to a truthy expression or None for
-    those methods, which is safe for file pruning but not for final row filters.
+    Predicate.to_arrow() falls back to a truthy expression or None for those
+    methods, which is safe for file pruning but not for final row filters.
+    Only methods explicitly allowlisted in ``_SAFE_ARROW_FILTER_METHODS`` are
+    considered safe; unknown methods conservatively fall back to row-level
+    filtering so a future to_arrow() fallback can never silently drop the
+    filter.
     """
     if predicate is None:
         return True
@@ -203,7 +222,7 @@ def predicate_supports_arrow_filter(predicate: Optional[Predicate]) -> bool:
         if current.method == 'and' or current.method == 'or':
             pending.extend(current.literals or [])
             continue
-        if current.method in _UNSAFE_ARROW_FILTER_METHODS:
+        if current.method not in _SAFE_ARROW_FILTER_METHODS:
             return False
         leaves += 1
         if leaves > _MAX_ARROW_FILTER_LEAVES:
