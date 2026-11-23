@@ -73,11 +73,17 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -1044,6 +1050,73 @@ public class ManifestFileTest {
 
         assertThat(deleted)
                 .containsExactlyInAnyOrder(firstDelete.identifier(), secondDelete.identifier());
+    }
+
+    @Test
+    void testReadDeletedEntriesBoundsInFlightReads() throws Exception {
+        ManifestFile manifestFile = createManifestFile(tempDir.toString());
+        List<ManifestFileMeta> manifests = new ArrayList<>();
+        List<ManifestEntry> deletedEntries = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            ManifestEntry source = gen.next();
+            ManifestEntry deleted =
+                    ManifestEntry.create(
+                            FileKind.DELETE,
+                            source.partition(),
+                            source.bucket(),
+                            source.totalBuckets(),
+                            source.file());
+            manifests.add(writeSingleManifest(manifestFile, Collections.singletonList(deleted)));
+            deletedEntries.add(deleted);
+        }
+
+        Map<ManifestFileMeta, ManifestEntry> entriesByManifest = new IdentityHashMap<>();
+        for (int i = 0; i < manifests.size(); i++) {
+            entriesByManifest.put(manifests.get(i), deletedEntries.get(i));
+        }
+        ManifestFileMeta firstManifest = manifests.get(0);
+
+        CountDownLatch firstReadStarted = new CountDownLatch(1);
+        CountDownLatch releaseFirstRead = new CountDownLatch(1);
+        AtomicInteger otherReadsWhileFirstHeld = new AtomicInteger();
+        AtomicReference<Set<FileEntry.Identifier>> resultHolder = new AtomicReference<>();
+
+        Thread worker =
+                new Thread(
+                        () ->
+                                resultHolder.set(
+                                        FileEntry.readDeletedEntries(
+                                                meta -> {
+                                                    if (meta == firstManifest) {
+                                                        firstReadStarted.countDown();
+                                                        try {
+                                                            releaseFirstRead.await();
+                                                        } catch (InterruptedException e) {
+                                                            throw new RuntimeException(e);
+                                                        }
+                                                    } else {
+                                                        otherReadsWhileFirstHeld.incrementAndGet();
+                                                    }
+                                                    return Collections.singletonList(
+                                                            entriesByManifest.get(meta));
+                                                },
+                                                manifests,
+                                                2)));
+        worker.start();
+        assertThat(firstReadStarted.await(30, TimeUnit.SECONDS)).isTrue();
+        // Let the pool settle. While the consumer is stuck on the first manifest,
+        // only its batch mate may be read; the rest must wait for later batches.
+        Thread.sleep(1000);
+        assertThat(otherReadsWhileFirstHeld.get()).isLessThanOrEqualTo(1);
+
+        releaseFirstRead.countDown();
+        worker.join(60_000);
+        assertThat(worker.isAlive()).isFalse();
+        assertThat(resultHolder.get())
+                .containsExactlyInAnyOrderElementsOf(
+                        deletedEntries.stream()
+                                .map(ManifestEntry::identifier)
+                                .collect(Collectors.toList()));
     }
 
     @Test

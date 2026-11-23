@@ -33,17 +33,15 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-import static org.apache.paimon.utils.ManifestReadThreadPool.randomlyExecuteSequentialReturn;
 import static org.apache.paimon.utils.ManifestReadThreadPool.sequentialBatchedExecute;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 import static org.apache.paimon.utils.Preconditions.checkState;
@@ -391,11 +389,12 @@ public interface FileEntry {
                     }
                     return identifiers;
                 };
-        Iterator<Identifier> identifiers =
-                randomlyExecuteSequentialReturn(processor, manifestFiles, manifestReadParallelism);
-        Set<Identifier> result = ConcurrentHashMap.newKeySet();
-        while (identifiers.hasNext()) {
-            result.add(identifiers.next());
+        // Batched execution bounds the number of manifests whose delete-entry
+        // lists are materialized at once, instead of holding every list in a future.
+        Set<Identifier> result = new HashSet<>();
+        for (Identifier identifier :
+                sequentialBatchedExecute(processor, manifestFiles, manifestReadParallelism)) {
+            result.add(identifier);
         }
         return result;
     }
@@ -415,11 +414,12 @@ public interface FileEntry {
                                 .filter(e -> e.kind() == FileKind.DELETE)
                                 .map(FileEntry::identifier)
                                 .collect(Collectors.toList());
-        Iterator<Identifier> identifiers =
-                randomlyExecuteSequentialReturn(processor, manifestFiles, manifestReadParallelism);
-        Set<Identifier> result = ConcurrentHashMap.newKeySet();
-        while (identifiers.hasNext()) {
-            result.add(identifiers.next());
+        // Same batching as above: results are consumed sequentially, so the
+        // in-flight delete-entry lists are capped at the read parallelism.
+        Set<Identifier> result = new HashSet<>();
+        for (Identifier identifier :
+                sequentialBatchedExecute(processor, manifestFiles, manifestReadParallelism)) {
+            result.add(identifier);
         }
         return result;
     }
